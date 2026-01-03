@@ -2,6 +2,37 @@
 
 本文档识别 Roc on Solana 平台的实施技术挑战，并提供实用解决方案。
 
+## 新方案：solana-zig-bootstrap 统一工具链
+
+### 核心思路
+
+使用 `solana-zig-bootstrap` 作为统一的编译工具链，解决了旧方案中的大多数技术难题：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              solana-zig-bootstrap (./solana-zig/zig)            │
+│                  Zig 0.15.2 + 原生 SBF 目标                      │
+│                                                                   │
+│  - 原生支持 sbf-freestanding 目标                                │
+│  - 不需要外部 sbpf-linker                                        │
+│  - 统一的 LLVM 版本                                              │
+│                                                                   │
+│  来源: https://github.com/joncinque/solana-zig-bootstrap         │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 新方案如何解决旧挑战
+
+| 旧挑战 | 旧方案痛点 | 新方案解决 |
+|--------|-----------|-----------|
+| LLVM 版本不匹配 | Zig/Roc/sbpf-linker LLVM 版本不一致 | 统一使用 solana-zig 的 LLVM |
+| sbpf-linker 链接错误 | 多文件链接失败，重定位问题 | 原生 Zig 链接器，无需 sbpf-linker |
+| 目标架构不匹配 | `bpfel-freestanding` 需要额外转换 | 原生 `sbf-freestanding` 目标 |
+| 构建步骤复杂 | IR → BC → OBJ → SO 多步骤 | 一步编译链接 |
+| 工具链维护 | 多个工具版本需要协调 | 单一工具链 |
+
+---
+
 ## 1. ABI 边界问题
 
 ### 挑战：数据布局不匹配
@@ -83,27 +114,29 @@ Roc 期望引用计数用于内存管理，但 Solana 使用简单的 bump 分�
 
 ```zig
 // src/allocator.zig
-var heap_pos: usize = 0;
-const HEAP_SIZE: usize = 32 * 1024; // Solana 堆限制
+const sdk = @import("solana_sdk");
+
+// 使用 SDK 的 bump allocator
+const heap = sdk.allocator.heap;
 
 export fn roc_alloc(size: usize, alignment: u32) ?[*]u8 {
-    const aligned_pos = std.mem.alignForward(heap_pos, alignment);
-    if (aligned_pos + size > HEAP_SIZE) return null;
-
-    const ptr = heap_start + aligned_pos;
-    heap_pos = aligned_pos + size;
-    return ptr;
+    const aligned_size = std.mem.alignForward(usize, size, alignment);
+    const result = heap.alloc(u8, aligned_size) catch return null;
+    return result.ptr;
 }
 
 export fn roc_realloc(ptr: [*]u8, new_size: usize, old_size: usize, alignment: u32) ?[*]u8 {
     // Solana 上：分配新的并复制（无就地重新分配）
     const new_ptr = roc_alloc(new_size, alignment) orelse return null;
-    @memcpy(new_ptr, ptr, old_size);
+    const copy_size = @min(old_size, new_size);
+    @memcpy(new_ptr[0..copy_size], ptr[0..copy_size]);
     return new_ptr;
 }
 
 export fn roc_dealloc(ptr: [*]u8, alignment: u32) void {
-    // 无操作：程序结束后 Solana 堆直接销毁
+    // 无操作：Solana 堆是 bump allocator，程序结束后销毁
+    _ = ptr;
+    _ = alignment;
 }
 ```
 
@@ -140,6 +173,8 @@ transfer = \from to amount ->
 
 ```zig
 // src/effects.zig
+const sdk = @import("solana_sdk");
+
 pub const EffectTag = enum(u8) {
     Log,
     Transfer,
@@ -157,68 +192,111 @@ pub const EffectData = union(EffectTag) {
 
 export fn roc_fx_handle(effect: EffectData) void {
     switch (effect) {
-        .Log => |msg| solana.log(msg.asSlice()),
+        .Log => |msg| sdk.log.log(msg.asSlice()),
         .Transfer => |data| {
-            const instruction = solana.systemProgram.transfer(
+            const instruction = sdk.system_program.transfer(
                 &data.from.bytes,
                 &data.to.bytes,
                 data.amount
             );
-            solana.invokeInstruction(&instruction);
+            sdk.invoke(&instruction);
         },
     }
 }
 ```
 
-## 4. LLVM 目标兼容性
+## 4. LLVM 目标兼容性 [核心阻塞问题]
 
-### 挑战：Roc 的 LLVM IR vs Solana 的 BPF 要求
-Solana 为 BPF 代码生成使用修改过的 LLVM，Roc 可能生成不兼容的 IR。
+### 挑战：Roc 的 LLVM 不支持 SBF 目标
+
+**发现时间**: 2026-01-04
+
+即使使用 solana-zig 编译 Roc 编译器，Roc 内部的 LLVM 代码生成仍然不支持 SBF 目标。
 
 **症状：**
-- 编译失败
-- 运行时崩溃
-- 不支持的指令
+```
+LLVM error: No available targets are compatible with triple "sbf-solana-solana"
+warning: LLVM compilation not ready, falling back to clang
+```
 
-### 解决方案：IR 翻译层
+**根本原因：**
+1. Roc 使用 Zig 的标准 LLVM 绑定进行代码生成
+2. 虽然 solana-zig 的 Zig 编译器支持 SBF，但 Roc 内部的 LLVM 调用使用的是标准 LLVM 配置
+3. 标准 LLVM 没有 SBF 目标后端
 
-**1. 使用 LLVM 工具进行翻译：**
+### 已完成的工作
+
+1. ✅ 使用 solana-zig 编译 Roc 编译器
+2. ✅ 修改 Roc 源码 `src/target/mod.zig` 添加 `sbfsolana` 目标
+3. ✅ 编译 SBF 宿主库 `platform/targets/sbfsolana/libhost.a`
+4. ✅ 更新 `platform/main.roc` 支持 sbfsolana 目标
+5. ✅ Roc 代码检查通过 (`roc check app.roc`)
+
+### 阻塞点
+
+Roc 的 LLVM 后端不支持 SBF 目标三元组 "sbf-solana-solana"。
+
+### 潜在解决方案
+
+**方案 A: 修改 Roc 的 LLVM 后端配置**
+- 难度：高
+- 需要深入理解 Roc 的 LLVM 集成
+- 可能需要修改 `src/llvm_compile/` 和 `src/backend/llvm/`
+
+**方案 B: 使用 Roc 解释器模式**
+- 难度：中
+- Roc 有解释器可以评估代码
+- 可能用于开发/测试，但不适合部署
+
+**方案 C: 编译为 WASM 然后转换**
+- 难度：中
+- Roc 支持 wasm32 目标
+- 可能需要 WASM 到 SBF 的转换器
+
+**方案 D: 使用旧版 Rust Roc 编译器**
+- 难度：中
+- 旧版有 `--emit-llvm-bc` 选项
+- 需要配合 solana-zig 的 LLVM 工具
+
+**方案 E: 贡献 SBF 支持到 Roc 上游**
+- 难度：高
+- 长期最佳方案
+- 需要与 Roc 社区合作
+
+### 当前状态
+
+v0.2.0 在此阻塞。需要选择一个方案并实施。
+
+**推荐下一步**: 探索方案 D（旧版 Roc 编译器），因为它有 LLVM 输出选项。
+
+## 5. sbpf-linker 链接问题 [已通过新方案解决]
+
+### 旧挑战：多文件链接失败
+sbpf-linker 在链接多个对象文件时报错。
+
+**旧方案症状：**
+- "Relocations found but no .rodata section"
+- 链接失败
+
+### 新方案解决
 
 ```bash
-# 如果 Roc 输出通用 LLVM IR
-roc build --emit-llvm-ir app.roc -o app.ll
+# 旧方案：使用 sbpf-linker（问题多多）
+sbpf-linker host.bc roc.o -o program.so
 
-# 转换为 BPF 兼容对象
-llc -march=bpf -filetype=obj app.ll -o app.o
+# 新方案：使用 solana-zig 原生链接
+./solana-zig/zig build-exe \
+    -target sbf-freestanding \
+    host.o roc.o \
+    -o program.so
 ```
 
-**2. 验证生成的代码：**
+**关键点：**
+- solana-zig 的链接器原生支持 SBF
+- 不需要外部工具
+- 重定位问题由工具链正确处理
 
-```bash
-# 检查 BPF 特定问题
-llvm-objdump -d app.o | grep -i invalid
-
-# 验证重定位
-readelf -r app.o
-```
-
-**3. 构建脚本自动化：**
-
-```zig
-// build.zig - 处理 Roc 编译
-const roc_step = b.addSystemCommand(&[_][]const u8{
-    "roc", "build", "--emit-llvm-bc", "app.roc", "-o", "app.bc"
-});
-
-// 转换为 BPF 对象
-const llc_step = b.addSystemCommand(&[_][]const u8{
-    "llc", "-march=bpf", "-filetype=obj", "app.bc", "-o", "app.o"
-});
-
-llc_step.dependOn(roc_step);
-```
-
-## 5. 测试和调试
+## 6. 测试和调试
 
 ### 挑战：Solana 环境中有限的可调试性
 智能合约很难调试，混合语言增加了复杂性。
@@ -261,16 +339,16 @@ test "full contract execution" {
 // 开发时广泛日志记录
 export fn roc_fx_log(msg: RocStr) void {
     // 开发中：记录一切
-    solana.log(msg.asSlice());
+    sdk.log.log(msg.asSlice());
 
     // 生产中：条件日志记录
     if (is_development) {
-        solana.log(msg.asSlice());
+        sdk.log.log(msg.asSlice());
     }
 }
 ```
 
-## 6. 性能优化
+## 7. 性能优化
 
 ### 挑战：资源受限平台上的函数式开销
 Roc 的函数式风格可能比命令式 Zig/Rust 引入性能开销。
@@ -311,18 +389,115 @@ pub const PackedAccount = packed struct {
 };
 ```
 
-## 7. 未来兼容性
+## 8. 工具链版本管理 [已通过新方案简化]
+
+### 旧挑战：多个工具版本协调
+需要协调 Zig、Roc、LLVM、sbpf-linker 等多个工具的版本。
+
+### 新方案解决
+
+使用 solana-zig-bootstrap 作为单一工具链：
+
+```
+solana-zig-bootstrap (Zig 0.15.2)
+    └── 内置 LLVM 版本
+    └── 内置 SBF 目标支持
+    └── 内置链接器
+        
+用于编译：
+    └── Roc 编译器
+    └── 宿主代码
+    └── 最终程序
+```
+
+**版本固定策略：**
+
+```bash
+# 项目中固定 solana-zig 版本
+# 在 build.zig.zon 中指定
+.dependencies = .{
+    .solana_zig = .{
+        .url = "https://github.com/joncinque/solana-zig-bootstrap/releases/download/v0.15.2/...",
+        .hash = "...",
+    },
+},
+```
+
+## 9. 未来兼容性
 
 ### 挑战：Roc 和 Solana 演进
 Roc 和 Solana 都在积极开发，可能破坏兼容性。
 
-**解决方案：版本固定和兼容层**
+### 解决方案：版本固定和兼容层
 
-- 固定特定 Roc 和 Zig 版本
+- 固定特定 Roc、Zig 和 solana-zig-bootstrap 版本
 - 为 API 变更维护兼容层
 - 定期测试新版本
 - 社区监控上游变更
 
+### 升级检查清单
+
+- [ ] 验证 solana-zig-bootstrap 新版本兼容性
+- [ ] 重新编译 Roc 编译器
+- [ ] 运行完整测试套件
+- [ ] 更新文档
+
 ## 总结
 
-虽然在 Solana 上实现 Roc 提出了几个技术挑战，但大多数可以通过 ABI 边界的精心设计、自定义分配器和彻底测试来解决。关键是维护函数式 Roc 世界和命令式 Solana 运行时之间的清晰分离，同时确保高效的数据编组和效果处理。
+### 当前进展 (2026-01-04)
+
+| 阶段 | 状态 | 说明 |
+|------|------|------|
+| solana-zig 获取 | ✅ 完成 | Zig 0.15.2 + SBF 支持 |
+| 纯 Zig 程序构建 | ✅ 完成 | v0.1.0, 可部署到 Solana |
+| Roc 编译器编译 | ✅ 完成 | 使用 solana-zig 编译成功 |
+| Roc SBF 目标修改 | ✅ 完成 | 添加 sbfsolana 到 target/mod.zig |
+| SBF 宿主库 | ✅ 完成 | libhost.a 已生成 |
+| Roc 平台配置 | ✅ 完成 | main.roc 添加 sbfsolana 目标 |
+| **Roc LLVM SBF 支持** | ❌ **阻塞** | LLVM 不识别 sbf 目标 |
+
+### 核心阻塞问题
+
+**Roc 内部的 LLVM 不支持 SBF 目标**
+
+即使 Roc 的目标系统添加了 sbfsolana，Roc 的 LLVM 代码生成器不识别 "sbf-solana-solana" 三元组。
+
+### 解决方案评估
+
+| 方案 | 可行性 | 工作量 | 推荐度 |
+|------|--------|--------|--------|
+| A: 修改 Roc LLVM 后端 | 中 | 高 | ⭐⭐ |
+| B: Roc 解释器 | 低 | 低 | ⭐ |
+| C: WASM 转 SBF | 中 | 中 | ⭐⭐ |
+| D: 旧版 Rust Roc | 中 | 中 | ⭐⭐⭐ |
+| E: 上游贡献 | 高 | 高 | ⭐⭐⭐⭐ (长期) |
+
+### 下一步建议
+
+1. **短期**: 探索旧版 Rust Roc 编译器的 `--emit-llvm-bc` 选项
+2. **中期**: 研究 WASM 到 SBF 的转换可行性
+3. **长期**: 与 Roc 社区合作贡献 SBF 目标支持
+
+### 新方案优势（对于纯 Zig 部分）
+
+1. **统一工具链**：solana-zig-bootstrap 解决了 Zig 编译 Solana 程序的所有问题
+2. **原生 SBF 支持**：Zig 代码可以直接编译为 SBF
+3. **简化构建**：一步编译链接
+4. **v0.1.0 完整可用**：纯 Zig 的 Solana 程序已可部署
+
+### 仍需解决的问题
+
+1. **Roc LLVM SBF 支持**：核心阻塞问题
+2. **ABI 边界**：Roc 和 Zig 之间的数据布局
+3. **内存管理**：Solana 的 32KB 堆限制
+4. **效果映射**：Roc 效果到 Solana syscall
+
+### 实施进度
+
+1. ✅ 获取并验证 solana-zig-bootstrap
+2. ✅ 使用 solana-zig 重新编译 Roc 编译器
+3. ✅ 修改 Roc 源码添加 SBF 目标
+4. ✅ 更新 build.zig 使用新工具链
+5. ✅ 编译 SBF 宿主库
+6. ❌ **阻塞**: Roc LLVM 不支持 SBF 代码生成
+7. ⏳ 需要选择替代方案

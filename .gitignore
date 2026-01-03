@@ -3,3 +3,6 @@ zig-out
 .program-id
 vendor
 roc_nightly-*
+zig-x86_64-linux-*
+program-keypair*
+solana-zig

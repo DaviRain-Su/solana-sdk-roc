@@ -1,16 +1,28 @@
 const std = @import("std");
 
-pub fn build(b: *std.Build) !void {
-    const optimize = .ReleaseSmall;
+/// Roc on Solana 构建配置
+///
+/// **重要**: 必须使用 solana-zig 运行此构建脚本
+///
+/// 构建命令:
+///   ./solana-zig/zig build          - 构建 Solana 程序
+///   ./solana-zig/zig build test     - 运行测试
+///   ./solana-zig/zig build solana   - 构建 Solana 程序
+///
+/// 参考: https://github.com/joncinque/solana-program-sdk-zig/blob/main/build.zig
+pub fn build(b: *std.Build) void {
+    const optimize = b.standardOptimizeOption(.{});
 
-    // Solana SDK dependency
+    // ============================================
+    // 测试配置 (在主机上运行)
+    // ============================================
+
     const solana_dep = b.dependency("solana_program_sdk", .{
         .target = b.graph.host,
         .optimize = optimize,
     });
     const solana_mod = solana_dep.module("solana_program_sdk");
 
-    // Host module for tests
     const host_mod = b.addModule("roc_solana_host", .{
         .root_source_file = b.path("src/host.zig"),
         .target = b.graph.host,
@@ -18,7 +30,6 @@ pub fn build(b: *std.Build) !void {
     });
     host_mod.addImport("solana_sdk", solana_mod);
 
-    // Unit tests (run on host, not BPF)
     const host_tests = b.addTest(.{
         .root_module = host_mod,
     });
@@ -28,94 +39,137 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_host_tests.step);
 
     // ============================================
-    // Solana BPF Build Pipeline (zignocchio style)
+    // Solana SBF 构建
     // ============================================
 
-    const ir_path = "zig-out/lib/host.ll";
-    const bc_path = "zig-out/lib/host.bc";
-    const host_obj_path = "zig-out/lib/host.o";
-    const roc_obj_path = "zig-out/lib/roc.o";
-    const so_path = "zig-out/lib/roc-hello.so";
+    // SBF 目标 (只有 solana-zig 支持)
+    const sbf_target = b.resolveTargetQuery(sbf_target_query);
 
-    const sdk_path = solana_dep.path("src/root.zig");
-
-    // Ensure output directory exists
-    const mkdir = b.addSystemCommand(&.{ "mkdir", "-p", "zig-out/lib" });
-
-    // Step 1: Generate LLVM IR from Zig host
-    std.debug.print("Step 1: Generating LLVM IR from src/host.zig\n", .{});
-    const gen_ir = b.addSystemCommand(&.{
-        "zig",
-        "build-lib",
-        "-target",
-        "bpfel-freestanding",
-        "-O",
-        "ReleaseSmall",
-        "-femit-llvm-ir=" ++ ir_path,
-        "-fno-emit-bin",
-        "--dep",
-        "solana_sdk",
-        "-Mroot=src/host.zig",
+    // Solana SDK for SBF target
+    const solana_sbf_dep = b.dependency("solana_program_sdk", .{
+        .target = sbf_target,
+        .optimize = .ReleaseSmall,
     });
-    gen_ir.addPrefixedFileArg("-Msolana_sdk=", sdk_path);
-    gen_ir.step.dependOn(&mkdir.step);
+    const solana_sbf_mod = solana_sbf_dep.module("solana_program_sdk");
 
-    // Step 2: Compile IR to bitcode using clang
-    std.debug.print("Step 2: Compiling IR to bitcode with clang\n", .{});
-    const compile_bc = b.addSystemCommand(&.{
-        "clang",
-        "-target",
-        "bpf",
-        "-c",
-        "-fembed-bitcode",
-        "-emit-llvm",
-        "-o",
-        bc_path,
-        ir_path,
+    // 创建 SBF 模块
+    const sbf_mod = b.createModule(.{
+        .root_source_file = b.path("src/host.zig"),
+        .target = sbf_target,
+        .optimize = .ReleaseSmall,
     });
-    compile_bc.step.dependOn(&gen_ir.step);
+    sbf_mod.addImport("solana_sdk", solana_sbf_mod);
 
-    // Step 3: Compile bitcode to object with llc
-    std.debug.print("Step 3: Compiling bitcode to object with llc\n", .{});
-    const compile_host_obj = b.addSystemCommand(&.{
-        "llc",
-        "-march=sbf",
-        "-mcpu=v3",
-        "-filetype=obj",
-        bc_path,
-        "-o",
-        host_obj_path,
+    // 构建 Solana 程序 (动态库)
+    const program = b.addLibrary(.{
+        .linkage = .dynamic,
+        .name = "roc-hello",
+        .root_module = sbf_mod,
     });
-    compile_host_obj.step.dependOn(&compile_bc.step);
 
-    // Step 4: Compile Roc IR to object (using our minimal roc_bpf.ll)
-    std.debug.print("Step 4: Compiling Roc IR to object\n", .{});
-    const compile_roc = b.addSystemCommand(&.{
-        "llc",
-        "-march=sbf",
-        "-mcpu=v3",
-        "-filetype=obj",
-        "zig-out/lib/roc_bpf.ll",
-        "-o",
-        roc_obj_path,
+    // 应用 Solana 程序链接配置
+    linkSolanaProgram(b, program);
+
+    // 安装
+    const install_artifact = b.addInstallArtifact(program, .{
+        .dest_dir = .{ .override = .{ .custom = "lib" } },
     });
-    compile_roc.step.dependOn(&mkdir.step);
 
-    // Step 5: Link with sbpf-lld
-    std.debug.print("Step 5: Linking with sbpf-lld\n", .{});
-    const link_program = b.addSystemCommand(&.{
-        "sbpf-lld",
-        host_obj_path,
-        roc_obj_path,
-        so_path,
-    });
-    link_program.step.dependOn(&compile_host_obj.step);
-    link_program.step.dependOn(&compile_roc.step);
-
-    // Build step
     const build_step = b.step("solana", "Build Solana program (.so)");
-    build_step.dependOn(&link_program.step);
+    build_step.dependOn(&install_artifact.step);
 
-    // Default step
-    b.default_step.dependOn(&link_program.step);
+    // 默认步骤
+    b.default_step.dependOn(&install_artifact.step);
+
+    // ============================================
+    // Roc 宿主静态库 (用于 Roc 平台集成)
+    // ============================================
+
+    // 创建宿主静态库模块
+    const host_lib_mod = b.createModule(.{
+        .root_source_file = b.path("src/host.zig"),
+        .target = sbf_target,
+        .optimize = .ReleaseSmall,
+    });
+    host_lib_mod.addImport("solana_sdk", solana_sbf_mod);
+
+    // 构建静态库
+    const host_lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "host",
+        .root_module = host_lib_mod,
+    });
+
+    // 安装到 platform/targets/sbfsolana/
+    const install_host_lib = b.addInstallArtifact(host_lib, .{
+        .dest_dir = .{ .override = .{ .custom = "../platform/targets/sbfsolana" } },
+    });
+
+    const host_step = b.step("host", "Build Roc host library for SBF");
+    host_step.dependOn(&install_host_lib.step);
+}
+
+// ============================================
+// SBF 目标定义 (需要 solana-zig)
+// ============================================
+
+pub const sbf_target_query: std.Target.Query = .{
+    .cpu_arch = .sbf,
+    .os_tag = .solana,
+};
+
+pub const sbfv2_target_query: std.Target.Query = .{
+    .cpu_arch = .sbf,
+    .cpu_model = .{
+        .explicit = &std.Target.sbf.cpu.sbfv2,
+    },
+    .os_tag = .solana,
+    .cpu_features_add = std.Target.sbf.cpu.sbfv2.features,
+};
+
+// ============================================
+// Solana 程序链接配置
+// ============================================
+
+/// 应用 Solana 程序所需的链接配置
+/// 参考: https://github.com/joncinque/solana-program-sdk-zig/blob/main/build.zig
+pub fn linkSolanaProgram(b: *std.Build, lib: *std.Build.Step.Compile) void {
+    // 创建 BPF 链接脚本
+    const write_file_step = b.addWriteFiles();
+    const linker_script = write_file_step.add("bpf.ld",
+        \\PHDRS
+        \\{
+        \\text PT_LOAD  ;
+        \\rodata PT_LOAD ;
+        \\data PT_LOAD ;
+        \\dynamic PT_DYNAMIC ;
+        \\}
+        \\
+        \\SECTIONS
+        \\{
+        \\. = SIZEOF_HEADERS;
+        \\.text : { *(.text*) } :text
+        \\.rodata : { *(.rodata*) } :rodata
+        \\.data.rel.ro : { *(.data.rel.ro*) } :rodata
+        \\.dynamic : { *(.dynamic) } :dynamic
+        \\.dynsym : { *(.dynsym) } :data
+        \\.dynstr : { *(.dynstr) } :data
+        \\.rel.dyn : { *(.rel.dyn) } :data
+        \\/DISCARD/ : {
+        \\*(.eh_frame*)
+        \\*(.gnu.hash*)
+        \\*(.hash*)
+        \\}
+        \\}
+    );
+
+    lib.step.dependOn(&write_file_step.step);
+
+    // 应用链接配置
+    lib.setLinkerScript(linker_script);
+    lib.stack_size = 4096;
+    lib.link_z_notext = true;
+    lib.root_module.pic = true;
+    lib.root_module.strip = true;
+    lib.entry = .{ .symbol_name = "entrypoint" };
 }

@@ -1,15 +1,20 @@
 # Roc on Solana 平台架构
 
-本文档概述了 Roc-Solana 平台的三层架构。
+本文档概述了 Roc-Solana 平台的四层架构。
 
 ## 概述
 
-Roc-Solana 平台使用三明治架构，利用现有的 Zig SDK 基础设施为 Roc 提供函数式编程接口。
+Roc-Solana 平台使用统一工具链架构，基于 `solana-zig-bootstrap` 提供原生 SBF 目标支持。
 
 ```
 ┌─────────────────────────────────────┐
+│      编译工具链层                     │
+│  （solana-zig-bootstrap - 核心）     │
+│   原生 SBF 目标支持的 Zig 编译器      │
+├─────────────────────────────────────┤
 │         Roc 平台层                   │
 │   （函数式接口 - app.roc）            │
+│   使用 solana-zig 编译的 Roc 编译器   │
 ├─────────────────────────────────────┤
 │        宿主胶水层                    │
 │   （Zig host.zig - 数据转换）         │
@@ -19,9 +24,28 @@ Roc-Solana 平台使用三明治架构，利用现有的 Zig SDK 基础设施为
 └─────────────────────────────────────┘
 ```
 
-## 第一层：Zig SDK 层（基础）
+## 工具链层（基础）
 
-**来源**：[solana-program-sdk-zig](https://github.com/DaviRain-Su/solana-program-sdk-zig)
+**来源**: [solana-zig-bootstrap](https://github.com/joncinque/solana-zig-bootstrap)
+
+该层是整个项目的基础，提供支持 Solana SBF 目标的 Zig 编译器：
+- 原生 `sbf-solana-solana` 目标支持
+- 集成 Solana 特定的 LLVM 后端
+- 无需额外的 sbpf-linker 工具
+- 直接链接生成 Solana eBPF 程序
+
+**关键特性**:
+```bash
+# 验证 SBF 目标支持
+./solana-zig/zig targets | grep sbf
+# 输出: sbf-solana-solana
+```
+
+## 第一层：Zig SDK 层（运行时支持）
+
+**来源**：[solana-program-sdk-zig](https://github.com/joncinque/solana-program-sdk-zig)
+
+**依赖**：需要使用 solana-zig-bootstrap 编译
 
 该层提供低级 Solana 功能：
 - 系统调用（sol_log、sol_invoke_signed 等）
@@ -39,6 +63,16 @@ pub fn sol_log(message: []const u8) void {
           [message_len] "{r2}" (message.len)
     );
 }
+```
+
+**构建目标**：
+```zig
+// 使用 sbf-solana-solana 目标
+const target = b.resolveTargetQuery(.{
+    .cpu_arch = .sbf,
+    .os_tag = .solana,
+    .abi = .solana,
+});
 ```
 
 ## 第二层：宿主胶水层（转换）

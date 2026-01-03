@@ -1303,6 +1303,95 @@ llvm_backend_required: true
 perceus_algorithm_enabled: true  # Roc 的引用计数算法
 ```
 
+### 🚨 工具链规范（强制）
+
+**核心原则**: 本项目使用自定义的 solana-zig-bootstrap 工具链，**禁止使用系统 zig**！
+
+#### Zig 编译器要求
+
+| 项目 | 要求 |
+|------|------|
+| **编译器路径** | `./solana-zig/zig` |
+| **版本** | 0.15.2 (solana-zig-bootstrap) |
+| **来源** | https://github.com/joncinque/solana-zig-bootstrap |
+| **系统 zig** | ❌ **禁止使用** |
+
+**为什么必须使用 solana-zig？**
+
+标准 Zig 编译器**不支持** Solana 的 SBF (Solana BPF) 目标架构：
+- 标准 Zig 没有 `sbf` CPU 架构
+- 标准 Zig 没有 `solana` 操作系统目标
+- 使用系统 zig 会导致编译错误：`enum 'Target.Cpu.Arch' has no member named 'sbf'`
+
+solana-zig-bootstrap 是修改版的 Zig，添加了：
+- `sbf` CPU 架构支持
+- `solana` 操作系统目标
+- 原生 SBF 链接器支持（无需 sbpf-linker）
+
+#### 正确的构建命令
+
+```bash
+# ✅ 正确 - 使用 solana-zig
+./solana-zig/zig build              # 构建 Solana 程序
+./solana-zig/zig build test         # 运行测试
+./solana-zig/zig build solana       # 构建 Solana 程序
+
+# ❌ 错误 - 禁止使用系统 zig
+zig build                           # 会失败！
+zig build test                      # 会失败！
+```
+
+#### Roc 编译器要求
+
+| 项目 | 要求 |
+|------|------|
+| **源码位置** | `./roc-source/` |
+| **编译工具** | 必须使用 `./solana-zig/zig` 编译 |
+| **标准 Roc** | ❌ **禁止使用**（不支持 SBF 目标） |
+
+**为什么 Roc 也需要用 solana-zig 编译？**
+
+Roc 编译器使用 Zig 作为其后端。为了生成 Solana 兼容的代码：
+1. Roc 必须使用支持 SBF 目标的 Zig 编译
+2. 这确保 Roc 的 LLVM 后端能生成 SBF 兼容的 IR
+3. 标准 Roc 无法生成 Solana 程序
+
+**编译 Roc 的正确方式：**
+
+```bash
+cd roc-source
+../solana-zig/zig build -Drelease
+
+# 验证
+./zig-out/bin/roc version
+```
+
+#### 工具链检查清单
+
+在开始任何开发工作前，必须验证：
+
+- [ ] `./solana-zig/zig version` 输出 `0.15.2`
+- [ ] `./solana-zig/zig targets | grep sbf` 显示 sbf 支持
+- [ ] `./solana-zig/zig build test` 测试通过
+- [ ] `./solana-zig/zig build` 生成 `zig-out/lib/roc-hello.so`
+
+#### 禁止行为
+
+- ❌ **禁止**: 使用系统 `zig` 命令
+- ❌ **禁止**: 使用标准下载的 Roc 编译器
+- ❌ **禁止**: 修改 build.zig 使其与系统 zig 兼容
+- ❌ **禁止**: 在文档中写 `zig build` 而不是 `./solana-zig/zig build`
+
+#### 错误处理
+
+如果看到以下错误，说明使用了错误的工具链：
+
+| 错误消息 | 原因 | 解决方案 |
+|---------|------|---------|
+| `enum 'Target.Cpu.Arch' has no member named 'sbf'` | 使用了系统 zig | 改用 `./solana-zig/zig` |
+| `no field named 'addSharedLibrary'` | solana-zig API 不同 | 使用 `addLibrary` + `linkage = .dynamic` |
+| `Roc: unsupported target` | 使用了标准 Roc | 用 solana-zig 重新编译 Roc |
+
 ### Roc 平台架构规范
 
 #### 三层架构要求
