@@ -34,7 +34,8 @@ pub fn build(b: *std.Build) void {
 
     const program = addSolanaProgram(b, solana_dep, base58_dep, .{
         .name = "roc-hello",
-        .root_source_file = b.path("src/host.zig"),
+        .host_source_file = b.path("src/host.zig"),
+        .roc_app_path = "examples/hello-world/app.roc",
         .optimize = .ReleaseSmall,
     });
 
@@ -46,12 +47,14 @@ pub fn build(b: *std.Build) void {
 
 pub const ProgramOptions = struct {
     name: []const u8,
-    root_source_file: std.Build.LazyPath,
+    host_source_file: std.Build.LazyPath,
+    roc_app_path: []const u8,
     optimize: std.builtin.OptimizeMode = .ReleaseSmall,
 };
 
 pub const SolanaProgram = struct {
-    bitcode_step: *std.Build.Step.Run,
+    roc_step: *std.Build.Step.Run,
+    host_step: *std.Build.Step.Run,
     link_step: *std.Build.Step.Run,
     install_step: *std.Build.Step,
 
@@ -72,12 +75,23 @@ pub fn addSolanaProgram(
     const sdk_path = solana_dep.path("src/root.zig");
     const base58_path = base58_dep.path("src/root.zig");
 
-    const bc_filename = b.fmt("{s}.bc", .{name});
+    const host_bc = b.fmt("{s}_host.bc", .{name});
+    const roc_obj = b.fmt("{s}_roc.o", .{name});
     const so_filename = b.fmt("{s}.so", .{name});
 
     const mkdir = b.addSystemCommand(&.{ "mkdir", "-p", "zig-out/lib" });
 
-    const gen_bitcode = b.addSystemCommand(&.{
+    const compile_roc = b.addSystemCommand(&.{
+        "sh",
+        "-c",
+        b.fmt(
+            "scripts/compile-roc.sh {s} zig-out/lib/{s}",
+            .{ options.roc_app_path, roc_obj },
+        ),
+    });
+    compile_roc.step.dependOn(&mkdir.step);
+
+    const gen_host_bc = b.addSystemCommand(&.{
         "zig",
         "build-obj",
         "-target",
@@ -86,26 +100,34 @@ pub fn addSolanaProgram(
         @tagName(opt),
         "-fPIC",
         "-fno-emit-bin",
-        b.fmt("-femit-llvm-bc=zig-out/lib/{s}", .{bc_filename}),
+        b.fmt("-femit-llvm-bc=zig-out/lib/{s}", .{host_bc}),
         "--dep",
         "solana_sdk",
     });
-    gen_bitcode.addPrefixedFileArg("-Mroot=", options.root_source_file);
-    gen_bitcode.addArg("--dep");
-    gen_bitcode.addArg("base58");
-    gen_bitcode.addPrefixedFileArg("-Msolana_sdk=", sdk_path);
-    gen_bitcode.addPrefixedFileArg("-Mbase58=", base58_path);
-    gen_bitcode.step.dependOn(&mkdir.step);
+    gen_host_bc.addPrefixedFileArg("-Mroot=", options.host_source_file);
+    gen_host_bc.addArg("--dep");
+    gen_host_bc.addArg("base58");
+    gen_host_bc.addPrefixedFileArg("-Msolana_sdk=", sdk_path);
+    gen_host_bc.addPrefixedFileArg("-Mbase58=", base58_path);
+    gen_host_bc.step.dependOn(&mkdir.step);
 
     const link_cmd = b.addSystemCommand(&.{
         "sh",
         "-c",
         b.fmt(
-            "LD_LIBRARY_PATH=/usr/lib/llvm-18/lib sbpf-linker --cpu v2 --llvm-args=-bpf-stack-size=4096 --export entrypoint -o zig-out/lib/{s} zig-out/lib/{s} 2>/dev/null || echo 'sbpf-linker failed or not installed'",
-            .{ so_filename, bc_filename },
+            "LD_LIBRARY_PATH=/usr/lib/llvm-18/lib sbpf-linker " ++
+                "--cpu v2 " ++
+                "--llvm-args=-bpf-stack-size=4096 " ++
+                "--export entrypoint " ++
+                "-o zig-out/lib/{s} " ++
+                "zig-out/lib/{s} " ++
+                "zig-out/lib/{s} " ++
+                "2>&1 || echo 'sbpf-linker failed'",
+            .{ so_filename, host_bc, roc_obj },
         ),
     });
-    link_cmd.step.dependOn(&gen_bitcode.step);
+    link_cmd.step.dependOn(&gen_host_bc.step);
+    link_cmd.step.dependOn(&compile_roc.step);
 
     const install_step = b.allocator.create(std.Build.Step) catch @panic("OOM");
     install_step.* = std.Build.Step.init(.{
@@ -116,7 +138,8 @@ pub fn addSolanaProgram(
     install_step.dependOn(&link_cmd.step);
 
     return .{
-        .bitcode_step = gen_bitcode,
+        .roc_step = compile_roc,
+        .host_step = gen_host_bc,
         .link_step = link_cmd,
         .install_step = install_step,
     };
