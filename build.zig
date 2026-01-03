@@ -1,29 +1,24 @@
 const std = @import("std");
 
-pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+pub fn build(b: *std.Build) !void {
+    const optimize = .ReleaseSmall;
 
+    // Solana SDK dependency
     const solana_dep = b.dependency("solana_program_sdk", .{
-        .target = target,
+        .target = b.graph.host,
         .optimize = optimize,
     });
     const solana_mod = solana_dep.module("solana_program_sdk");
 
-    const base58_dep = b.dependency("base58", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const base58_mod = base58_dep.module("base58");
-
+    // Host module for tests
     const host_mod = b.addModule("roc_solana_host", .{
         .root_source_file = b.path("src/host.zig"),
-        .target = target,
+        .target = b.graph.host,
         .optimize = optimize,
     });
     host_mod.addImport("solana_sdk", solana_mod);
-    host_mod.addImport("base58", base58_mod);
 
+    // Unit tests (run on host, not BPF)
     const host_tests = b.addTest(.{
         .root_module = host_mod,
     });
@@ -32,115 +27,95 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_host_tests.step);
 
-    const program = addSolanaProgram(b, solana_dep, base58_dep, .{
-        .name = "roc-hello",
-        .host_source_file = b.path("src/host.zig"),
-        .roc_app_path = "examples/hello-world/app.roc",
-        .optimize = .ReleaseSmall,
-    });
+    // ============================================
+    // Solana BPF Build Pipeline (zignocchio style)
+    // ============================================
 
-    const build_step = b.step("solana", "Build Solana program (.so)");
-    build_step.dependOn(program.getInstallStep());
-
-    b.default_step.dependOn(program.getInstallStep());
-}
-
-pub const ProgramOptions = struct {
-    name: []const u8,
-    host_source_file: std.Build.LazyPath,
-    roc_app_path: []const u8,
-    optimize: std.builtin.OptimizeMode = .ReleaseSmall,
-};
-
-pub const SolanaProgram = struct {
-    roc_step: *std.Build.Step.Run,
-    host_step: *std.Build.Step.Run,
-    link_step: *std.Build.Step.Run,
-    install_step: *std.Build.Step,
-
-    pub fn getInstallStep(self: SolanaProgram) *std.Build.Step {
-        return self.install_step;
-    }
-};
-
-pub fn addSolanaProgram(
-    b: *std.Build,
-    solana_dep: *std.Build.Dependency,
-    base58_dep: *std.Build.Dependency,
-    options: ProgramOptions,
-) SolanaProgram {
-    const name = options.name;
-    const opt = options.optimize;
+    const ir_path = "zig-out/lib/host.ll";
+    const bc_path = "zig-out/lib/host.bc";
+    const host_obj_path = "zig-out/lib/host.o";
+    const roc_obj_path = "zig-out/lib/roc.o";
+    const so_path = "zig-out/lib/roc-hello.so";
 
     const sdk_path = solana_dep.path("src/root.zig");
-    const base58_path = base58_dep.path("src/root.zig");
 
-    const host_bc = b.fmt("{s}_host.bc", .{name});
-    const roc_obj = b.fmt("{s}_roc.o", .{name});
-    const so_filename = b.fmt("{s}.so", .{name});
-
+    // Ensure output directory exists
     const mkdir = b.addSystemCommand(&.{ "mkdir", "-p", "zig-out/lib" });
 
-    const compile_roc = b.addSystemCommand(&.{
-        "sh",
-        "-c",
-        b.fmt(
-            "scripts/compile-roc.sh {s} zig-out/lib/{s}",
-            .{ options.roc_app_path, roc_obj },
-        ),
-    });
-    compile_roc.step.dependOn(&mkdir.step);
-
-    const gen_host_bc = b.addSystemCommand(&.{
+    // Step 1: Generate LLVM IR from Zig host
+    std.debug.print("Step 1: Generating LLVM IR from src/host.zig\n", .{});
+    const gen_ir = b.addSystemCommand(&.{
         "zig",
-        "build-obj",
+        "build-lib",
         "-target",
         "bpfel-freestanding",
         "-O",
-        @tagName(opt),
-        "-fPIC",
+        "ReleaseSmall",
+        "-femit-llvm-ir=" ++ ir_path,
         "-fno-emit-bin",
-        b.fmt("-femit-llvm-bc=zig-out/lib/{s}", .{host_bc}),
         "--dep",
         "solana_sdk",
+        "-Mroot=src/host.zig",
     });
-    gen_host_bc.addPrefixedFileArg("-Mroot=", options.host_source_file);
-    gen_host_bc.addArg("--dep");
-    gen_host_bc.addArg("base58");
-    gen_host_bc.addPrefixedFileArg("-Msolana_sdk=", sdk_path);
-    gen_host_bc.addPrefixedFileArg("-Mbase58=", base58_path);
-    gen_host_bc.step.dependOn(&mkdir.step);
+    gen_ir.addPrefixedFileArg("-Msolana_sdk=", sdk_path);
+    gen_ir.step.dependOn(&mkdir.step);
 
-    const link_cmd = b.addSystemCommand(&.{
-        "sh",
+    // Step 2: Compile IR to bitcode using clang
+    std.debug.print("Step 2: Compiling IR to bitcode with clang\n", .{});
+    const compile_bc = b.addSystemCommand(&.{
+        "clang",
+        "-target",
+        "bpf",
         "-c",
-        b.fmt(
-            "LD_LIBRARY_PATH=/usr/lib/llvm-18/lib sbpf-linker " ++
-                "--cpu v2 " ++
-                "--llvm-args=-bpf-stack-size=4096 " ++
-                "--export entrypoint " ++
-                "-o zig-out/lib/{s} " ++
-                "zig-out/lib/{s} " ++
-                "zig-out/lib/{s} " ++
-                "2>&1 || echo 'sbpf-linker failed'",
-            .{ so_filename, host_bc, roc_obj },
-        ),
+        "-fembed-bitcode",
+        "-emit-llvm",
+        "-o",
+        bc_path,
+        ir_path,
     });
-    link_cmd.step.dependOn(&gen_host_bc.step);
-    link_cmd.step.dependOn(&compile_roc.step);
+    compile_bc.step.dependOn(&gen_ir.step);
 
-    const install_step = b.allocator.create(std.Build.Step) catch @panic("OOM");
-    install_step.* = std.Build.Step.init(.{
-        .id = .custom,
-        .name = b.fmt("install {s}", .{name}),
-        .owner = b,
+    // Step 3: Compile bitcode to object with llc
+    std.debug.print("Step 3: Compiling bitcode to object with llc\n", .{});
+    const compile_host_obj = b.addSystemCommand(&.{
+        "llc",
+        "-march=sbf",
+        "-mcpu=v3",
+        "-filetype=obj",
+        bc_path,
+        "-o",
+        host_obj_path,
     });
-    install_step.dependOn(&link_cmd.step);
+    compile_host_obj.step.dependOn(&compile_bc.step);
 
-    return .{
-        .roc_step = compile_roc,
-        .host_step = gen_host_bc,
-        .link_step = link_cmd,
-        .install_step = install_step,
-    };
+    // Step 4: Compile Roc IR to object (using our minimal roc_bpf.ll)
+    std.debug.print("Step 4: Compiling Roc IR to object\n", .{});
+    const compile_roc = b.addSystemCommand(&.{
+        "llc",
+        "-march=sbf",
+        "-mcpu=v3",
+        "-filetype=obj",
+        "zig-out/lib/roc_bpf.ll",
+        "-o",
+        roc_obj_path,
+    });
+    compile_roc.step.dependOn(&mkdir.step);
+
+    // Step 5: Link with sbpf-lld
+    std.debug.print("Step 5: Linking with sbpf-lld\n", .{});
+    const link_program = b.addSystemCommand(&.{
+        "sbpf-lld",
+        host_obj_path,
+        roc_obj_path,
+        so_path,
+    });
+    link_program.step.dependOn(&compile_host_obj.step);
+    link_program.step.dependOn(&compile_roc.step);
+
+    // Build step
+    const build_step = b.step("solana", "Build Solana program (.so)");
+    build_step.dependOn(&link_program.step);
+
+    // Default step
+    b.default_step.dependOn(&link_program.step);
 }
