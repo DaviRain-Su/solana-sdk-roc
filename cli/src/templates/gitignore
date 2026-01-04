@@ -1,0 +1,6 @@
+.zig-cache
+zig-out
+.roc-solana
+.program-id
+node_modules
+*.so

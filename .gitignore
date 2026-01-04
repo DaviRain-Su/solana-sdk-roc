@@ -15,6 +15,7 @@ test-ledger
 solana-zig
 roc-source
 roc-sbf
+roc-sbf-*
 
 # Generated command
 roc-solana
@@ -41,3 +42,7 @@ node_modules
 # IDE
 .vscode
 .idea
+
+# test (exclude test-roc which is the example directory)
+test-cli-*
+test-ledger

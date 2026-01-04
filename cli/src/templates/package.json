@@ -1,0 +1,10 @@
+{
+  "name": "my-solana-program",
+  "type": "module",
+  "scripts": {
+    "test": "bun scripts/test.mjs"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.98.0"
+  }
+}

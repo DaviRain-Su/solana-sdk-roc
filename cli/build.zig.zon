@@ -1,0 +1,6 @@
+.{
+    .name = .roc_solana_cli,
+    .version = "0.1.0",
+    .fingerprint = 0xc1e7b318162ec841,
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

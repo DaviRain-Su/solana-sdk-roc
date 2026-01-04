@@ -1,6 +1,6 @@
-platform "roc-solana"
+platform "solana"
     requires {} { main : Str }
-    exposes []
+    exposes [Host]
     packages {}
     imports []
     provides [mainForHost]

@@ -1,0 +1,143 @@
+name: Release CLI
+
+on:
+  push:
+    tags:
+      - 'cli-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (e.g., 0.1.0)'
+        required: true
+        default: '0.1.0'
+
+env:
+  ZIG_VERSION: "0.15.2"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-linux
+            artifact: roc-solana-linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-linux
+            artifact: roc-solana-linux-aarch64
+          - os: macos-13
+            target: x86_64-macos
+            artifact: roc-solana-macos-x86_64
+          - os: macos-14
+            target: aarch64-macos
+            artifact: roc-solana-macos-aarch64
+
+    runs-on: ${{ matrix.os }}
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build CLI
+        working-directory: cli
+        run: |
+          zig build -Doptimize=ReleaseFast
+          mv zig-out/bin/roc-solana ${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: cli/${{ matrix.artifact }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          for dir in artifacts/*/; do
+            name=$(basename "$dir")
+            cp "$dir/$name" "release/$name"
+            chmod +x "release/$name"
+          done
+          ls -la release/
+
+      - name: Create checksums
+        working-directory: release
+        run: |
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/cli-v}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: cli-v${{ steps.version.outputs.version }}
+          name: roc-solana CLI v${{ steps.version.outputs.version }}
+          body: |
+            ## roc-solana CLI v${{ steps.version.outputs.version }}
+
+            Roc on Solana 命令行工具
+
+            ### 安装
+
+            ```bash
+            # Linux x86_64
+            curl -L https://github.com/${{ github.repository }}/releases/download/cli-v${{ steps.version.outputs.version }}/roc-solana-linux-x86_64 -o roc-solana
+            chmod +x roc-solana
+            sudo mv roc-solana /usr/local/bin/
+
+            # macOS Apple Silicon
+            curl -L https://github.com/${{ github.repository }}/releases/download/cli-v${{ steps.version.outputs.version }}/roc-solana-macos-aarch64 -o roc-solana
+            chmod +x roc-solana
+            sudo mv roc-solana /usr/local/bin/
+            ```
+
+            ### 使用
+
+            ```bash
+            roc-solana toolchain install   # 安装依赖
+            roc-solana init my-program     # 创建项目
+            cd my-program
+            roc-solana build               # 编译
+            roc-solana deploy              # 部署
+            roc-solana test                # 测试
+            ```
+
+            ### 文件
+
+            | 文件 | 平台 |
+            |------|------|
+            | roc-solana-linux-x86_64 | Linux x86_64 |
+            | roc-solana-linux-aarch64 | Linux ARM64 |
+            | roc-solana-macos-x86_64 | macOS Intel |
+            | roc-solana-macos-aarch64 | macOS Apple Silicon |
+
+          files: |
+            release/*
+          draft: false
+          prerelease: false
