@@ -4,7 +4,7 @@
 
 set -e
 
-REPO="aspect-build/solana-sdk-roc"
+REPO="DaviRain-Su/solana-sdk-roc"
 CLI_VERSION="0.1.0"
 INSTALL_DIR="${HOME}/.local/bin"
 
