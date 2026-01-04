@@ -6,3 +6,6 @@ roc_nightly-*
 zig-x86_64-linux-*
 program-keypair*
 solana-zig
+solana-platform-*
+platform-*
+solana-rust
