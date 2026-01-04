@@ -14,9 +14,19 @@ const sdk = @import("solana_program_sdk");
 const sdk_allocator = sdk.allocator;
 const sdk_log = sdk.log;
 
+// Import stub module to ensure it's linked (provides roc__main_for_host_1_exposed_generic)
+// This is only used when building the standalone Solana program, not for tests
+const stub = if (is_solana and !is_test) @import("stub") else struct {};
+comptime {
+    // Force stub exports to be included in the build
+    if (is_solana and !is_test) {
+        _ = &stub.roc__main_for_host_1_exposed_generic;
+    }
+}
+
 // Configuration: Set to true when linking with actual Roc-compiled code
 // For testing without Roc, set to false
-const use_external_roc = false;
+const use_external_roc = true;
 
 // When using external Roc, declare extern functions
 // When not using external Roc, we'll provide Zig implementations

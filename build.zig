@@ -43,6 +43,12 @@ pub fn build(b: *std.Build) void {
     // ============================================
 
     buildSolanaProgram(b);
+
+    // ============================================
+    // Roc 平台静态库构建 (用于 Roc 编译器链接)
+    // ============================================
+
+    buildPlatformLib(b);
 }
 
 fn buildSolanaProgram(b: *std.Build) void {
@@ -62,7 +68,7 @@ fn buildSolanaProgram(b: *std.Build) void {
     });
     const solana_mod = solana_dep.module("solana_program_sdk");
 
-    // 创建模块
+    // 创建主模块
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/host.zig"),
         .target = target,
@@ -74,6 +80,14 @@ fn buildSolanaProgram(b: *std.Build) void {
 
     // 关键：禁用 sanitizer 以生成 PIC 兼容代码
     root_mod.sanitize_c = .off;
+
+    // 添加 stub 模块 (提供 roc__main_for_host_1_exposed_generic)
+    const stub_mod = b.createModule(.{
+        .root_source_file = b.path("src/stub.zig"),
+        .target = target,
+        .optimize = .ReleaseSmall,
+    });
+    root_mod.addImport("stub", stub_mod);
 
     // 创建库
     const lib = b.addLibrary(.{
@@ -87,6 +101,54 @@ fn buildSolanaProgram(b: *std.Build) void {
 
     // Install the library
     b.installArtifact(lib);
+}
+
+/// Build static library for Roc platform
+/// This creates libhost.a with PIC for use by Roc's linker
+fn buildPlatformLib(b: *std.Build) void {
+    // SBF 目标配置
+    const sbf_target: std.Target.Query = .{
+        .cpu_arch = .sbf,
+        .os_tag = .solana,
+    };
+    const target = b.resolveTargetQuery(sbf_target);
+
+    // 获取 Solana SDK 依赖
+    const solana_dep = b.dependency("solana_program_sdk", .{
+        .target = target,
+        .optimize = .ReleaseSmall,
+    });
+    const solana_mod = solana_dep.module("solana_program_sdk");
+
+    // 创建模块 (静态库使用)
+    const root_mod = b.createModule(.{
+        .root_source_file = b.path("src/host.zig"),
+        .target = target,
+        .optimize = .ReleaseSmall,
+    });
+
+    // 添加 Solana SDK 导入
+    root_mod.addImport("solana_program_sdk", solana_mod);
+
+    // 关键配置：启用 PIC 以兼容 Roc 的链接
+    root_mod.pic = true;
+    root_mod.sanitize_c = .off;
+    root_mod.strip = true;
+
+    // 创建静态库
+    const lib = b.addLibrary(.{
+        .name = "host",
+        .root_module = root_mod,
+        .linkage = .static,
+    });
+
+    // 安装到 platform/targets/sbfsolana/
+    const install_lib = b.addInstallArtifact(lib, .{
+        .dest_dir = .{ .override = .{ .custom = "../platform/targets/sbfsolana" } },
+    });
+
+    const platform_step = b.step("platform", "Build static library for Roc platform");
+    platform_step.dependOn(&install_lib.step);
 }
 
 fn linkSolanaProgram(b: *std.Build, lib: *std.Build.Step.Compile) void {

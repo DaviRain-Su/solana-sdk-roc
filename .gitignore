@@ -12,3 +12,6 @@ solana-rust
 solana-llvm
 llvm-*
 node_modules
+*.so
+*.ld
+solana-zig-bootstarp

@@ -7,6 +7,7 @@ platform "solana"
         files: "targets/",
         exe: {
             sbfsolana: ["libhost.a", app],
+            x64linux: ["libhost.a", app],
         }
     }
 
