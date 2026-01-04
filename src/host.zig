@@ -12,7 +12,8 @@ const sdk_allocator = sdk.allocator;
 const sdk_log = sdk.log;
 
 // Configuration: Set to true when linking with actual Roc-compiled code
-const use_external_roc = true;
+// For testing without Roc, set to false
+const use_external_roc = false;
 
 // When using external Roc, declare extern functions
 // When not using external Roc, we'll provide Zig implementations

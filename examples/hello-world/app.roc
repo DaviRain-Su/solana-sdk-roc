@@ -1,6 +1,4 @@
-app "hello"
-    provides [main] to pf
-    imports [pf.Stdout]
+app [main] { pf: platform "../../platform/main.roc" }
 
 main : Str
 main = "Hello from Roc on Solana!"
