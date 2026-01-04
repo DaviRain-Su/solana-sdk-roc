@@ -1381,6 +1381,25 @@ cd roc-source
 - ❌ **禁止**: 使用标准下载的 Roc 编译器
 - ❌ **禁止**: 修改 build.zig 使其与系统 zig 兼容
 - ❌ **禁止**: 在文档中写 `zig build` 而不是 `./solana-zig/zig build`
+- ❌ **禁止**: 使用 `sbpf-linker` 进行链接（solana-zig 原生支持 SBF 链接，无需外部工具）
+
+#### 正确的编译流程
+
+**强制要求**: 使用 solana-zig 原生 SBF 链接，不依赖 sbpf-linker：
+
+```bash
+# ✅ 正确 - 使用 solana-zig 原生 SBF 支持
+./solana-zig/zig build                    # 直接生成 .so 文件
+
+# ❌ 错误 - 禁止使用 sbpf-linker
+zig build-lib -femit-llvm-bc ...          # 生成 bitcode
+sbpf-linker ... -o program.so             # 禁止！
+```
+
+**为什么禁止 sbpf-linker？**
+- solana-zig 原生支持 `sbf-solana` 目标，可直接生成 SBF 可执行文件
+- sbpf-linker 需要额外的 LLVM 共享库依赖，增加环境复杂度
+- 使用原生工具链更简洁、更可靠
 
 #### 错误处理
 

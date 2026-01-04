@@ -11,3 +11,4 @@ platform-*
 solana-rust
 solana-llvm
 llvm-*
+node_modules
