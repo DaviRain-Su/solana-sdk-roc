@@ -1,179 +1,180 @@
-# Roc on Solana 平台架构
+# Roc on Solana 架构文档
 
-本文档概述了 Roc-Solana 平台的四层架构。
-
-## 概述
-
-Roc-Solana 平台使用统一工具链架构，基于 `solana-zig-bootstrap` 提供原生 SBF 目标支持。
+## 整体架构
 
 ```
-┌─────────────────────────────────────┐
-│      编译工具链层                     │
-│  （solana-zig-bootstrap - 核心）     │
-│   原生 SBF 目标支持的 Zig 编译器      │
-├─────────────────────────────────────┤
-│         Roc 平台层                   │
-│   （函数式接口 - app.roc）            │
-│   使用 solana-zig 编译的 Roc 编译器   │
-├─────────────────────────────────────┤
-│        宿主胶水层                    │
-│   （Zig host.zig - 数据转换）         │
-├─────────────────────────────────────┤
-│       Zig SDK 层                     │
-│  （solana-program-sdk-zig - 核心）    │
-└─────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                       Roc 源代码 (.roc)                          │
+│                                                                   │
+│  app [main] { pf: platform "platform/main.roc" }                 │
+│  main : Str                                                       │
+│  main = "Fib(10) = $(Num.to_str (fib 10))"                       │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                 Roc 编译器 (修改版)                               │
+│                                                                   │
+│  - Cargo 编译: --features target-bpf                             │
+│  - LLVM 18 后端                                                   │
+│  - SBF ABI 修复 (字符串/列表传递)                                 │
+│  - 输出: LLVM Bitcode (.o)                                       │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                 solana-zig (0.15.2)                              │
+│                                                                   │
+│  - 原生 SBF 目标支持                                             │
+│  - build-obj: LLVM BC → SBF Object                               │
+│  - build-lib: 链接生成 .so                                        │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                 Solana SBF 程序 (.so)                            │
+│                                                                   │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐      │
+│  │  roc_app.o  │  │  host.zig   │  │  solana-program-sdk │      │
+│  │  (Roc 逻辑) │  │  (胶水代码) │  │  (Solana SDK)       │      │
+│  └─────────────┘  └─────────────┘  └─────────────────────┘      │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     Solana 区块链                                 │
+│                                                                   │
+│  solana program deploy → 执行                                     │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-## 工具链层（基础）
+## 组件说明
 
-**来源**: [solana-zig-bootstrap](https://github.com/joncinque/solana-zig-bootstrap)
+### 1. Roc 编译器 (修改版)
 
-该层是整个项目的基础，提供支持 Solana SBF 目标的 Zig 编译器：
-- 原生 `sbf-solana-solana` 目标支持
-- 集成 Solana 特定的 LLVM 后端
-- 无需额外的 sbpf-linker 工具
-- 直接链接生成 Solana eBPF 程序
+**位置**: `roc-source/`
 
-**关键特性**:
+**修改内容**:
+- 添加 `target-bpf` Cargo feature
+- 修复 SBF 目标的 LLVM 三元组 (`sbf-solana-solana`)
+- 修复字符串/列表 ABI (参数传值，返回值直接返回)
+- 避免 SBF 不支持的 LLVM 内联函数
+
+**编译命令**:
 ```bash
-# 验证 SBF 目标支持
-./solana-zig/zig targets | grep sbf
-# 输出: sbf-solana-solana
+LLVM_SYS_180_PREFIX=/usr/lib/llvm-18 cargo build --release --features target-bpf -p roc_cli
 ```
 
-## 第一层：Zig SDK 层（运行时支持）
+### 2. solana-zig
 
-**来源**：[solana-program-sdk-zig](https://github.com/joncinque/solana-program-sdk-zig)
+**位置**: `solana-zig/`
 
-**依赖**：需要使用 solana-zig-bootstrap 编译
+**来源**: [joncinque/solana-zig-bootstrap](https://github.com/joncinque/solana-zig-bootstrap)
 
-该层提供低级 Solana 功能：
-- 系统调用（sol_log、sol_invoke_signed 等）
-- 内存管理（Solana 32KB 堆的 Bump 分配器）
-- 数据序列化（Borsh 格式处理）
-- 入口点管理
+**作用**:
+- 提供支持 SBF 目标的 Zig 编译器
+- 将 LLVM bitcode 编译为 SBF 目标代码
+- 链接生成最终的 Solana 程序
 
-**关键组件**：
-```zig
-// SDK 中 sol_log 实现的示例
-pub fn sol_log(message: []const u8) void {
-    asm volatile ("call sol_log_"
-        :
-        : [message_ptr] "{r1}" (message.ptr),
-          [message_len] "{r2}" (message.len)
-    );
-}
-```
+### 3. Host (host.zig)
 
-**构建目标**：
-```zig
-// 使用 sbf-solana-solana 目标
-const target = b.resolveTargetQuery(.{
-    .cpu_arch = .sbf,
-    .os_tag = .solana,
-    .abi = .solana,
-});
-```
+**位置**: `src/host.zig`
 
-## 第二层：宿主胶水层（转换）
+**职责**:
+- Solana 程序入口点 (`entrypoint`)
+- Roc 内存管理函数 (`roc_alloc`, `roc_dealloc`, `roc_realloc`)
+- 辅助函数 (`roc_panic`, `roc_dbg`, `memcpy_c`, `memset_c`)
+- RocStr 解码 (支持 SSO)
 
-**文件**：`platform/host.zig`
+### 4. Solana SDK
 
-该层充当 Roc 函数式世界和 Zig 命令式世界之间的桥梁。它处理：
-- Roc 运行时内存分配（roc_alloc、roc_dealloc）
-- 数据格式转换（RocStr ↔ []u8，Roc 结构体 ↔ Zig 结构体）
-- 效果处理（将 Roc 效果转换为 Zig SDK 调用）
+**位置**: `vendor/solana-program-sdk-zig/`
 
-**实现示例**：
-```zig
-const sdk = @import("solana-program-sdk");
-
-export fn roc_fx_log(msg: RocStr) void {
-    const zig_slice = msg.asSlice();
-    sdk.log.sol_log(zig_slice);
-}
-
-export fn roc_fx_transfer(from: *Pubkey, to: *Pubkey, amount: u64) void {
-    const instruction = sdk.system_program.transfer(from, to, amount);
-    sdk.invoke(&instruction, ...);
-}
-```
-
-## 第三层：Roc 平台层（接口）
-
-**文件**：`platform/main.roc`、`app.roc`
-
-该层为开发者提供函数式编程接口：
-- 镜像 Solana 数据结构的类型定义
-- 副作用的效果声明
-- 纯函数式合约逻辑
-
-**平台定义示例**：
-```elm
-platform "solana"
-    requires {} { main : Context -> Result Unit [Error Str] }
-    exposes [ Context, Account, Pubkey, log, transfer ]
-    packages {}
-    imports []
-    provides [ mainForHost ]
-
-Pubkey : [ Pubkey (List U8) ]
-
-Account : {
-    key : Pubkey,
-    lamports : U64,
-    data : List U8,
-    owner : Pubkey,
-    is_signer : Bool,
-}
-
-log : Str -> Task {} []
-log = \msg -> Effect.log msg
-
-transfer : Pubkey -> Pubkey -> U64 -> Task {} []
-transfer = \from to amount -> Effect.transfer from to amount
-```
-
-**用户合约示例**：
-```elm
-app "token-contract"
-    packages { pf: "platform/main.roc" }
-    imports [ pf.Context, pf.Account, pf.log, pf.transfer ]
-    provides [ main ] to pf
-
-main : Context -> Result {} [Error Str]
-main = \ctx ->
-    when List.first ctx.accounts is
-        Ok account ->
-            if account.is_signer then
-                transfer account.key some_other_key 1000
-                log "Transfer successful"
-                Ok {}
-            else
-                Err (Error "First account must be signer")
-        
-        Err _ -> Err (Error "No accounts provided")
-```
+**提供**:
+- `sdk.allocator` - SBF 堆分配器 (32KB 限制)
+- `sdk.log` - Solana 日志输出
+- `sdk.syscalls` - Solana 系统调用
 
 ## 数据流
 
-1. Solana 运行时调用 `entrypoint(input)` 在 host.zig 中
-2. 宿主使用 Zig SDK 解析输入为结构化数据
-3. 宿主将 Zig 结构体转换为 Roc 兼容格式
-4. 宿主调用 Roc 的 `mainForHost` 函数
-5. Roc 执行纯函数式逻辑，触发效果
-6. 效果由宿主胶水函数处理，调用 Zig SDK
-7. 结果序列化回并返回给 Solana
+### 编译时
 
-## 优势
+```
+Roc 源码 (.roc)
+    │ [roc build --target sbf --no-link]
+    ▼
+LLVM Bitcode (.o)
+    │ [cp .o .bc]
+    ▼
+LLVM Bitcode (.bc)
+    │ [solana-zig build-obj -target sbf-solana]
+    ▼
+SBF Object (roc_app.o)
+    │ [solana-zig build-lib]
+    ▼
+Solana 程序 (.so)
+```
 
-- **性能**：Roc 的 Perceus 算法提供 GC 免费性能，无 GC 暂停
-- **开发者体验**：函数式编程，强类型和模式匹配
-- **重用性**：80% 的实现工作由现有的 Zig SDK 处理
-- **可维护性**：各层之间有清晰的职责分离
+### 运行时
 
-## 挑战
+```
+Solana 调用 entrypoint()
+    │
+    ▼
+Host 调用 roc__mainForHost_1_exposed_generic(&result)
+    │
+    ▼
+Roc 代码执行 (可能调用 roc_alloc, roc_panic)
+    │
+    ▼
+Host 解码 RocStr，调用 sdk.log.log()
+    │
+    ▼
+返回 0 (成功)
+```
 
-- Roc 和 Zig 之间的 ABI 兼容性
-- LLVM 目标兼容性（Roc → BPF via Zig 工具链）
-- 构建系统集成用于混合语言编译
+## RocStr 内存布局
+
+```
+64-bit 系统上的 RocStr (24 字节，带 SSO):
+
+堆字符串 (len > 23):
+┌──────────────┬──────────────┬──────────────┐
+│ ptr (8字节)  │ len (8字节)  │ cap (8字节)  │
+└──────────────┴──────────────┴──────────────┘
+
+小字符串 (len <= 23):
+┌──────────────────────────────────────────────┬───────┐
+│          内联字符数据 (最多 23 字节)          │SSO|len│
+└──────────────────────────────────────────────┴───────┘
+
+SSO 标志: 第三个 u64 的最高位 (1 = 小字符串)
+长度: bits 56-62
+```
+
+## 限制
+
+| 限制 | 值 |
+|------|------|
+| 堆内存 | 32 KB |
+| 栈深度 | 4 KB |
+| 计算单元 | 200,000 CU |
+| 程序大小 | 10 MB |
+
+## 文件结构
+
+```
+solana-sdk-roc/
+├── solana-zig/              # solana-zig-bootstrap
+├── roc-source/              # Roc 编译器源码 (需修改)
+├── src/host.zig             # Solana Host
+├── vendor/solana-program-sdk-zig/
+├── test-roc/                # 测试 Roc 程序
+├── docs/
+│   ├── journey-from-zero-to-success.md  # 完整历程
+│   ├── roc-build-guide.md               # 编译指南
+│   ├── roc-sbf-complete.md              # 修改说明
+│   └── roc-sbf-complete.patch           # 完整补丁
+├── build.zig
+└── build.zig.zon
+```
