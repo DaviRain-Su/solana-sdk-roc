@@ -2,6 +2,21 @@
 
 使用 Roc 函数式编程语言在 Solana 区块链上编写智能合约。
 
+## 安装
+
+```bash
+curl -sSf https://raw.githubusercontent.com/DaviRain-Su/solana-sdk-roc/main/install.sh | sh
+```
+
+安装完成后：
+
+```bash
+roc-solana toolchain install  # 安装工具链
+roc-solana init my-program    # 创建新项目
+cd my-program
+roc-solana build              # 编译
+```
+
 ## 快速开始
 
 ```bash
