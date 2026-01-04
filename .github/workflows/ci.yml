@@ -58,8 +58,8 @@ jobs:
         if: steps.cache-solana-zig.outputs.cache-hit != 'true'
         run: |
           curl -L "https://github.com/joncinque/solana-zig-bootstrap/releases/download/${{ env.SOLANA_ZIG_VERSION }}/zig-x86_64-linux-musl.tar.bz2" -o zig.tar.bz2
-          tar -xjf zig.tar.bz2
-          mv zig-x86_64-linux-musl solana-zig
+          mkdir -p solana-zig
+          tar -xjf zig.tar.bz2 -C solana-zig --strip-components=1
           rm zig.tar.bz2
 
       - name: Verify solana-zig
@@ -95,8 +95,8 @@ jobs:
         if: steps.cache-solana-zig.outputs.cache-hit != 'true'
         run: |
           curl -L "https://github.com/joncinque/solana-zig-bootstrap/releases/download/${{ env.SOLANA_ZIG_VERSION }}/zig-x86_64-linux-musl.tar.bz2" -o zig.tar.bz2
-          tar -xjf zig.tar.bz2
-          mv zig-x86_64-linux-musl solana-zig
+          mkdir -p solana-zig
+          tar -xjf zig.tar.bz2 -C solana-zig --strip-components=1
           rm zig.tar.bz2
 
       - name: Install standard Zig (for CLI build)
