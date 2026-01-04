@@ -5,13 +5,26 @@ const std = @import("std");
 /// **重要**: 必须使用 solana-zig 运行此构建脚本
 ///
 /// 构建命令:
-///   ./solana-zig/zig build          - 构建 Solana 程序
-///   ./solana-zig/zig build test     - 运行测试
-///   ./solana-zig/zig build solana   - 构建 Solana 程序
+///   ./solana-zig/zig build              - 构建 Solana 程序 (使用已有的 roc_app.o)
+///   ./solana-zig/zig build roc          - 完整流程: Roc -> SBF bitcode -> SBF object -> .so
+///   ./solana-zig/zig build test         - 运行测试
+///   ./solana-zig/zig build platform     - 构建 Roc 平台静态库
+///   ./solana-zig/zig build deploy       - 部署到 Solana
 ///
-/// 参考: https://github.com/joncinque/solana-program-sdk-zig/blob/main/build.zig
+/// 完整 Roc 编译流程:
+///   1. Roc 编译器生成 SBF LLVM bitcode (roc build --target sbf --no-link)
+///   2. solana-zig 将 bitcode 编译为 SBF object (zig build-obj)
+///   3. 链接生成 Solana 程序 (zig build)
+///
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
+
+    // ============================================
+    // 配置选项
+    // ============================================
+
+    const roc_app = b.option([]const u8, "roc-app", "Roc application file path") orelse "test-roc/simple.roc";
+    const roc_compiler = b.option([]const u8, "roc-compiler", "Path to Roc compiler") orelse "./roc-source/target/release/roc";
 
     // ============================================
     // 测试配置 (在主机上运行)
@@ -39,110 +52,168 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_host_tests.step);
 
     // ============================================
-    // Solana SBF 构建 (使用 Solana SDK 的链接配置)
+    // 完整 Roc 编译流程 (使用修改后的 Roc 编译器)
     // ============================================
 
-    buildSolanaProgram(b);
+    // Step 1: 调用 Roc 编译器生成 SBF LLVM bitcode
+    const roc_build_step = b.addSystemCommand(&.{
+        roc_compiler,
+        "build",
+        "--target",
+        "sbf",
+        "--no-link",
+    });
+    roc_build_step.addArg(roc_app);
+    roc_build_step.setName("roc-compile-sbf");
+
+    // Step 2: 复制 .o (bitcode) 为 .bc 以便 zig 识别
+    const copy_bc_step = b.addSystemCommand(&.{
+        "cp",
+    });
+
+    // 从 roc_app 路径推导输出文件名
+    // 例如: test-roc/simple.roc -> test-roc/simple.o -> test-roc/simple.bc
+    const app_base = std.fs.path.stem(roc_app);
+    const app_dir = std.fs.path.dirname(roc_app) orelse ".";
+    const roc_output_o = b.fmt("{s}/{s}.o", .{ app_dir, app_base });
+    const roc_output_bc = b.fmt("{s}/{s}.bc", .{ app_dir, app_base });
+
+    copy_bc_step.addArg(roc_output_o);
+    copy_bc_step.addArg(roc_output_bc);
+    copy_bc_step.step.dependOn(&roc_build_step.step);
+    copy_bc_step.setName("copy-to-bc");
+
+    // Step 3: 使用 solana-zig 将 bitcode 编译为 SBF object
+    const compile_bc_step = b.addSystemCommand(&.{
+        "./solana-zig/zig",
+        "build-obj",
+    });
+    compile_bc_step.addArg(roc_output_bc);
+    compile_bc_step.addArgs(&.{
+        "-target",
+        "sbf-solana",
+        "-O",
+        "ReleaseSmall",
+        "-femit-bin=roc_app.o",
+    });
+    compile_bc_step.step.dependOn(&copy_bc_step.step);
+    compile_bc_step.setName("compile-bc-to-sbf");
 
     // ============================================
-    // Roc 平台静态库构建 (用于 Roc 编译器链接)
+    // Solana SBF 构建
+    // ============================================
+
+    const build_result = buildSolanaProgram(b);
+
+    // 完整 Roc 流程步骤
+    build_result.lib.step.dependOn(&compile_bc_step.step);
+
+    const roc_step = b.step("roc", "Full Roc compilation: Roc -> SBF bitcode -> SBF object -> .so");
+    roc_step.dependOn(build_result.install_step);
+
+    // 默认构建步骤 (使用已存在的 roc_app.o)
+    b.default_step.dependOn(build_result.install_step);
+
+    // ============================================
+    // Roc 平台静态库构建
     // ============================================
 
     buildPlatformLib(b);
+
+    // ============================================
+    // 部署步骤
+    // ============================================
+
+    const deploy_step = b.addSystemCommand(&.{
+        "solana",
+        "program",
+        "deploy",
+        "zig-out/lib/roc-hello.so",
+    });
+    deploy_step.step.dependOn(build_result.install_step);
+
+    const deploy = b.step("deploy", "Deploy program to Solana");
+    deploy.dependOn(&deploy_step.step);
 }
 
-fn buildSolanaProgram(b: *std.Build) void {
+const BuildResult = struct {
+    lib: *std.Build.Step.Compile,
+    install_step: *std.Build.Step,
+};
+
+fn buildSolanaProgram(b: *std.Build) BuildResult {
     const name = "roc-hello";
 
-    // SBF 目标配置
     const sbf_target: std.Target.Query = .{
         .cpu_arch = .sbf,
         .os_tag = .solana,
     };
     const target = b.resolveTargetQuery(sbf_target);
 
-    // 获取 Solana SDK 依赖
     const solana_dep = b.dependency("solana_program_sdk", .{
         .target = target,
         .optimize = .ReleaseSmall,
     });
     const solana_mod = solana_dep.module("solana_program_sdk");
 
-    // 创建主模块
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/host.zig"),
         .target = target,
         .optimize = .ReleaseSmall,
     });
 
-    // 添加 Solana SDK 导入
     root_mod.addImport("solana_program_sdk", solana_mod);
-
-    // 关键：禁用 sanitizer 以生成 PIC 兼容代码
     root_mod.sanitize_c = .off;
 
-    // 添加 stub 模块 (提供 roc__main_for_host_1_exposed_generic)
-    const stub_mod = b.createModule(.{
-        .root_source_file = b.path("src/stub.zig"),
-        .target = target,
-        .optimize = .ReleaseSmall,
-    });
-    root_mod.addImport("stub", stub_mod);
-
-    // 创建库
     const lib = b.addLibrary(.{
         .name = name,
         .root_module = root_mod,
         .linkage = .dynamic,
     });
 
-    // 应用 SBF 程序链接配置 (基于 vendor SDK 的模式)
+    // 链接 Roc 编译的 SBF 对象文件
+    lib.addObjectFile(b.path("roc_app.o"));
+
     linkSolanaProgram(b, lib);
 
-    // Install the library
-    b.installArtifact(lib);
+    const install_artifact = b.addInstallArtifact(lib, .{});
+
+    return .{
+        .lib = lib,
+        .install_step = &install_artifact.step,
+    };
 }
 
-/// Build static library for Roc platform
-/// This creates libhost.a with PIC for use by Roc's linker
 fn buildPlatformLib(b: *std.Build) void {
-    // SBF 目标配置
     const sbf_target: std.Target.Query = .{
         .cpu_arch = .sbf,
         .os_tag = .solana,
     };
     const target = b.resolveTargetQuery(sbf_target);
 
-    // 获取 Solana SDK 依赖
     const solana_dep = b.dependency("solana_program_sdk", .{
         .target = target,
         .optimize = .ReleaseSmall,
     });
     const solana_mod = solana_dep.module("solana_program_sdk");
 
-    // 创建模块 (静态库使用)
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/host.zig"),
         .target = target,
         .optimize = .ReleaseSmall,
     });
 
-    // 添加 Solana SDK 导入
     root_mod.addImport("solana_program_sdk", solana_mod);
-
-    // 关键配置：启用 PIC 以兼容 Roc 的链接
     root_mod.pic = true;
     root_mod.sanitize_c = .off;
     root_mod.strip = true;
 
-    // 创建静态库
     const lib = b.addLibrary(.{
         .name = "host",
         .root_module = root_mod,
         .linkage = .static,
     });
 
-    // 安装到 platform/targets/sbfsolana/
     const install_lib = b.addInstallArtifact(lib, .{
         .dest_dir = .{ .override = .{ .custom = "../platform/targets/sbfsolana" } },
     });
