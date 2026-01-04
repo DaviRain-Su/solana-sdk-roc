@@ -11,8 +11,8 @@ zig-out
 program-keypair*
 test-ledger
 
-# Dependencies (fetch with build.zig.zon)
-vendor
+# Dependencies (fetched automatically by zig build)
+.zig-cache/p
 
 # Toolchains (download separately)
 solana-zig
