@@ -14,4 +14,5 @@ llvm-*
 node_modules
 *.so
 *.ld
-solana-zig-bootstarp
+solana-zig-*
+test-ledger

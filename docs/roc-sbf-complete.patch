@@ -1,0 +1,4653 @@
+diff --git a/build.zig b/build.zig
+index 110c031ef8..704dafd03b 100644
+--- a/build.zig
++++ b/build.zig
+@@ -22,6 +22,11 @@ const musl_cross_targets = [_]CrossTarget{
+     .{ .name = "arm64musl", .query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl } },
+ };
+ 
++/// Solana SBF cross-compile target (for Roc on Solana)
++const sbf_cross_targets = [_]CrossTarget{
++    .{ .name = "sbfsolana", .query = .{ .cpu_arch = .sbf, .os_tag = .solana, .abi = .none } },
++};
++
+ /// Glibc cross-compile targets (dynamic linking)
+ const glibc_cross_targets = [_]CrossTarget{
+     .{ .name = "x64glibc", .query = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu } },
+@@ -3133,6 +3138,7 @@ fn addMainExe(
+         .{ .name = "x64glibc", .query = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu } },
+         .{ .name = "arm64glibc", .query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu } },
+         .{ .name = "wasm32", .query = .{ .cpu_arch = .wasm32, .os_tag = .freestanding, .abi = .none } },
++        .{ .name = "sbfsolana", .query = .{ .cpu_arch = .sbf, .os_tag = .solana, .abi = .none } },
+     };
+ 
+     for (cross_compile_shim_targets) |cross_target| {
+@@ -3152,11 +3158,18 @@ fn addMainExe(
+         });
+         configureBackend(cross_builtins_obj, cross_resolved_target);
+ 
++        // For SBF/Solana, use a minimal stub since programs run compiled, not interpreted
++        const is_sbf_target = cross_target.query.cpu_arch == .sbf and cross_target.query.os_tag == .solana;
++        const shim_source = if (is_sbf_target)
++            b.path("src/interpreter_shim/sbf_stub.zig")
++        else
++            b.path("src/interpreter_shim/main.zig");
++
+         // Build interpreter shim library for this target
+         const cross_shim_lib = b.addLibrary(.{
+             .name = b.fmt("roc_interpreter_shim_{s}", .{cross_target.name}),
+             .root_module = b.createModule(.{
+-                .root_source_file = b.path("src/interpreter_shim/main.zig"),
++                .root_source_file = shim_source,
+                 .target = cross_resolved_target,
+                 .optimize = optimize,
+                 .strip = strip,
+@@ -3169,7 +3182,10 @@ fn addMainExe(
+ 
+         // For wasm32, only add the modules needed by the interpreter shim
+         // (compile, watch, lsp, repl, ipc use threading/file I/O not available on freestanding)
+-        if (cross_target.query.cpu_arch == .wasm32 and cross_target.query.os_tag == .freestanding) {
++        // For SBF/Solana, we use a minimal stub that doesn't need any modules
++        if (is_sbf_target) {
++            // SBF stub doesn't need any modules - it's just a minimal stub
++        } else if (cross_target.query.cpu_arch == .wasm32 and cross_target.query.os_tag == .freestanding) {
+             cross_shim_lib.root_module.addImport("base", roc_modules.base);
+             cross_shim_lib.root_module.addImport("collections", roc_modules.collections);
+             cross_shim_lib.root_module.addImport("types", roc_modules.types);
+@@ -3187,9 +3203,13 @@ fn addMainExe(
+         } else {
+             roc_modules.addAll(cross_shim_lib);
+         }
+-        cross_shim_lib.root_module.addImport("compiled_builtins", compiled_builtins_module);
+-        cross_shim_lib.step.dependOn(&write_compiled_builtins.step);
+-        cross_shim_lib.addObject(cross_builtins_obj);
++
++        // Only add compiled_builtins and builtins object for non-SBF targets
++        if (!is_sbf_target) {
++            cross_shim_lib.root_module.addImport("compiled_builtins", compiled_builtins_module);
++            cross_shim_lib.step.dependOn(&write_compiled_builtins.step);
++            cross_shim_lib.addObject(cross_builtins_obj);
++        }
+         cross_shim_lib.bundle_compiler_rt = true;
+ 
+         // Copy to target-specific directory for embedding
+@@ -3449,8 +3469,9 @@ fn addStaticLlvmOptionsToModule(mod: *std.Build.Module) !void {
+     mod.linkSystemLibrary("z", link_static);
+ 
+     if (mod.resolved_target.?.result.os.tag != .windows or mod.resolved_target.?.result.abi != .msvc) {
+-        // Use Zig's bundled static libc++ to keep the binary statically linked
+-        mod.link_libcpp = true;
++        // Link libstdc++ instead of libc++ for compatibility with Solana LLVM
++        // (Solana LLVM is compiled with GCC/libstdc++)
++        mod.linkSystemLibrary("stdc++", link_static);
+     }
+ 
+     if (mod.resolved_target.?.result.os.tag == .windows) {
+@@ -3578,6 +3599,12 @@ const llvm_libs = [_][]const u8{
+     "LLVMBPFCodeGen",
+     "LLVMBPFDesc",
+     "LLVMBPFInfo",
++    // SBF (Solana BPF) target support - added for Roc on Solana
++    "LLVMSBFDisassembler",
++    "LLVMSBFAsmParser",
++    "LLVMSBFCodeGen",
++    "LLVMSBFDesc",
++    "LLVMSBFInfo",
+     "LLVMAVRDisassembler",
+     "LLVMAVRAsmParser",
+     "LLVMAVRCodeGen",
+diff --git a/crates/cli/Cargo.toml b/crates/cli/Cargo.toml
+index d92457d13d..e0ff60e36f 100644
+--- a/crates/cli/Cargo.toml
++++ b/crates/cli/Cargo.toml
+@@ -30,6 +30,7 @@ target-arm = ["roc_build/target-arm", "roc_repl_cli/target-arm"]
+ target-wasm32 = ["roc_build/target-wasm32"]
+ target-x86 = ["roc_build/target-x86", "roc_repl_cli/target-x86"]
+ target-x86_64 = ["roc_build/target-x86_64", "roc_repl_cli/target-x86_64"]
++target-bpf = ["roc_build/target-bpf"]
+ 
+ target-all = [
+     "target-aarch64",
+@@ -37,6 +38,7 @@ target-all = [
+     "target-x86",
+     "target-x86_64",
+     "target-wasm32",
++    "target-bpf",
+ ]
+ 
+ sanitizers = ["roc_build/sanitizers"]
+diff --git a/crates/compiler/build/Cargo.toml b/crates/compiler/build/Cargo.toml
+index 88574d3d28..79f2ea30ba 100644
+--- a/crates/compiler/build/Cargo.toml
++++ b/crates/compiler/build/Cargo.toml
+@@ -50,6 +50,7 @@ target-arm = []
+ target-wasm32 = []
+ target-x86 = []
+ target-x86_64 = ["roc_gen_dev/target-x86_64"]
++target-bpf = []
+ 
+ # This is used to enable fuzzing and sanitizers.
+ # Example use is describe here: https://github.com/bhansconnect/roc-fuzz
+diff --git a/crates/compiler/build/src/program.rs b/crates/compiler/build/src/program.rs
+index fd0c4635f2..133d0d57b8 100644
+--- a/crates/compiler/build/src/program.rs
++++ b/crates/compiler/build/src/program.rs
+@@ -386,6 +386,15 @@ fn gen_from_mono_module_llvm<'a>(
+                 // module.print_to_file(app_ll_file);
+                 module.write_bitcode_to_memory()
+             }
++            Architecture::Sbf => {
++                // For SBF/Solana, emit bitcode - it will be compiled to SBF by external tools
++                // The SBF target is not available in standard LLVM, so we can't use target_machine
++                if emit_llvm_ir {
++                    eprintln!("Emitting SBF LLVM IR to {}", &app_ll_file.display());
++                    module.print_to_file(&app_ll_file).unwrap();
++                }
++                module.write_bitcode_to_memory()
++            }
+             _ => internal_error!(
+                 "TODO gracefully handle unsupported architecture: {:?}",
+                 target.architecture()
+@@ -464,6 +473,12 @@ fn gen_from_mono_module_dev<'a>(
+         (_, Architecture::X86_32) => {
+             internal_error!("Dev compiler backend does not support 32 bit x86 architectures")
+         }
++        (_, Architecture::Sbf) => {
++            // SBF uses LLVM backend, not dev backend
++            internal_error!(
++                "Dev compiler backend does not support SBF architecture. Use LLVM backend."
++            )
++        }
+     }
+ }
+ 
+diff --git a/crates/compiler/build/src/target.rs b/crates/compiler/build/src/target.rs
+index 9234b90e19..82ca10a11b 100644
+--- a/crates/compiler/build/src/target.rs
++++ b/crates/compiler/build/src/target.rs
+@@ -21,6 +21,8 @@ pub fn target_triple_str(target: Target) -> &'static str {
+         Target::MacX64 => "x86_64-unknown-darwin10",
+         Target::Wasm32 => "wasm32-unknown-unknown",
+         Target::WinX64 => "x86_64-pc-windows-gnu",
++        // Solana BPF target - uses BPF little-endian
++        Target::Sbf => "bpfel-unknown-unknown",
+         _ => internal_error!("TODO gracefully handle unsupported target: {:?}", target),
+     }
+ }
+@@ -41,6 +43,9 @@ pub fn init_arch(target: Target) {
+         Architecture::Wasm32 if cfg!(feature = "target-wasm32") => {
+             LlvmTarget::initialize_webassembly(&InitializationConfig::default());
+         }
++        Architecture::Sbf if cfg!(feature = "target-bpf") => {
++            LlvmTarget::initialize_bpf(&InitializationConfig::default());
++        }
+         _ => internal_error!(
+             "TODO gracefully handle unsupported target architecture: {:?}",
+             target.architecture()
+@@ -61,6 +66,7 @@ pub fn arch_str(target: Target) -> &'static str {
+         roc_target::Architecture::Aarch64 if cfg!(feature = "target-aarch64") => "aarch64",
+         roc_target::Architecture::Aarch32 if cfg!(feature = "target-arm") => "arm",
+         roc_target::Architecture::Wasm32 if cfg!(feature = "target-wasm32") => "wasm32",
++        roc_target::Architecture::Sbf if cfg!(feature = "target-bpf") => "bpfel",
+         _ => internal_error!(
+             "TODO gracefully handle unsupported target architecture: {:?}",
+             target.architecture()
+diff --git a/crates/compiler/builtins/bitcode/build.zig b/crates/compiler/builtins/bitcode/build.zig
+index 7c51dbb680..03bc89189c 100644
+--- a/crates/compiler/builtins/bitcode/build.zig
++++ b/crates/compiler/builtins/bitcode/build.zig
+@@ -1,53 +1,55 @@
+ const std = @import("std");
+ const builtin = @import("builtin");
+-const mem = std.mem;
+ const Build = std.Build;
+ const LazyPath = Build.LazyPath;
+-const CrossTarget = std.zig.CrossTarget;
+-const Arch = std.Target.Cpu.Arch;
++
++// Check if this Zig build supports SBF target (solana-zig)
++const has_sbf_support = @hasField(std.Target.Cpu.Arch, "sbf");
+ 
+ pub fn build(b: *Build) void {
+-    // const mode = b.standardOptimizeOption(.{ .preferred_optimize_mode = .Debug });
+     const mode = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
+ 
+-    // Options
+     const main_path = b.path("src/main.zig");
+ 
+-    // Tests
+-    const main_tests = b.addTest(.{ .root_source_file = main_path, .link_libc = true });
+-    const test_step = b.step("test", "Run tests");
+-    test_step.dependOn(&b.addRunArtifact(main_tests).step);
+-
+     // Targets
+     const host_target = b.resolveTargetQuery(.{
+         .cpu_model = .baseline,
+         .os_tag = builtin.os.tag,
+     });
++
++    // Tests
++    const test_module = b.createModule(.{
++        .root_source_file = main_path,
++        .target = host_target,
++    });
++    test_module.linkSystemLibrary("c", .{});
++    const main_tests = b.addTest(.{ .root_module = test_module });
++    const test_step = b.step("test", "Run tests");
++    test_step.dependOn(&b.addRunArtifact(main_tests).step);
+     const linux32_target = b.resolveTargetQuery(.{
+-        .cpu_arch = std.Target.Cpu.Arch.x86,
+-        .os_tag = std.Target.Os.Tag.linux,
+-        .abi = std.Target.Abi.none,
++        .cpu_arch = .x86,
++        .os_tag = .linux,
++        .abi = .none,
+     });
+     const linux_x64_target = b.resolveTargetQuery(.{
+-        .cpu_arch = std.Target.Cpu.Arch.x86_64,
+-        .os_tag = std.Target.Os.Tag.linux,
+-        .abi = std.Target.Abi.none,
++        .cpu_arch = .x86_64,
++        .os_tag = .linux,
++        .abi = .none,
+     });
+     const linux_aarch64_target = b.resolveTargetQuery(.{
+-        .cpu_arch = std.Target.Cpu.Arch.aarch64,
+-        .os_tag = std.Target.Os.Tag.linux,
+-        .abi = std.Target.Abi.none,
++        .cpu_arch = .aarch64,
++        .os_tag = .linux,
++        .abi = .none,
+     });
+     const windows64_target = b.resolveTargetQuery(.{
+-        .cpu_arch = std.Target.Cpu.Arch.x86_64,
+-        .os_tag = std.Target.Os.Tag.windows,
+-        .abi = std.Target.Abi.none,
++        .cpu_arch = .x86_64,
++        .os_tag = .windows,
++        .abi = .none,
+     });
+     const wasm32_target = b.resolveTargetQuery(.{
+-        // 32-bit wasm
+-        .cpu_arch = std.Target.Cpu.Arch.wasm32,
+-        .os_tag = std.Target.Os.Tag.freestanding,
+-        .abi = std.Target.Abi.none,
++        .cpu_arch = .wasm32,
++        .os_tag = .freestanding,
++        .abi = .none,
+     });
+ 
+     // LLVM IR
+@@ -62,25 +64,58 @@ pub fn build(b: *Build) void {
+     generateObjectFile(b, mode, host_target, main_path, "object", "builtins-host");
+     generateObjectFile(b, mode, windows64_target, main_path, "windows-x86_64-object", "builtins-windows-x86_64");
+     generateObjectFile(b, mode, wasm32_target, main_path, "wasm32-object", "builtins-wasm32");
++
++    // SBF target (only available with solana-zig)
++    // Note: SBF builtins must be built separately using solana-zig
++    // Use: ./solana-zig/zig build ir-sbf
++    if (has_sbf_support) {
++        generateSbfBuiltins(b, mode);
++    }
++}
++
++fn generateSbfBuiltins(b: *Build, mode: std.builtin.OptimizeMode) void {
++    if (!has_sbf_support) return;
++
++    const sbf_target = b.resolveTargetQuery(.{
++        .cpu_arch = .sbf,
++        .os_tag = .solana,
++        .abi = .none,
++    });
++    // Using full main.zig with conditional compilation for SBF
++    // sort.zig is excluded via conditional import in list.zig (Solana has 4KB stack limit)
++    const sbf_main_path = b.path("src/main.zig");
++    generateLlvmIrFileSbf(b, mode, sbf_target, sbf_main_path, "ir-sbf", "builtins-sbf");
++    generateObjectFileSbf(b, mode, sbf_target, sbf_main_path, "sbf-object", "builtins-sbf");
+ }
+ 
+-// TODO zig 0.9 can generate .bc directly, switch to that when it is released!
+ fn generateLlvmIrFile(
+     b: *Build,
+-    mode: std.builtin.Mode,
++    mode: std.builtin.OptimizeMode,
+     target: std.Build.ResolvedTarget,
+     main_path: LazyPath,
+     step_name: []const u8,
+     object_name: []const u8,
+ ) void {
+-    const obj = b.addObject(.{ .strip = true, .pic = true, .name = object_name, .root_source_file = main_path, .optimize = mode, .target = target, .use_llvm = true });
++    const is_wasm = target.result.cpu.arch == .wasm32;
++
++    const obj_module = b.createModule(.{
++        .root_source_file = main_path,
++        .optimize = mode,
++        .target = target,
++        .pic = if (is_wasm) null else true,
++        .strip = true,
++        .stack_check = false,
++    });
+ 
+-    obj.root_module.stack_check = false;
++    const obj = b.addObject(.{
++        .name = object_name,
++        .root_module = obj_module,
++        .use_llvm = true,
++    });
+ 
+-    if (target.result.cpu.arch != std.Target.Cpu.Arch.wasm32)
++    if (!is_wasm)
+         obj.bundle_compiler_rt = true;
+ 
+-    // Generating the bin seems required to get zig to generate the llvm ir.
+     _ = obj.getEmittedBin();
+     const ir_file = obj.getEmittedLlvmIr();
+     const bc_file = obj.getEmittedLlvmBc();
+@@ -93,35 +128,39 @@ fn generateLlvmIrFile(
+     b.getInstallStep().dependOn(ir);
+ }
+ 
+-// Generate Object File
+-// TODO: figure out how to get this to emit symbols that are only scoped to linkage (global but hidden).
+-// @bhansconnect: I believe anything with global scope will still be preserved by the linker even if it
+-// is never called. I think it could theoretically be called by a dynamic lib that links to the executable
+-// or something similar.
+ fn generateObjectFile(
+     b: *Build,
+-    mode: std.builtin.Mode,
++    mode: std.builtin.OptimizeMode,
+     target: std.Build.ResolvedTarget,
+     main_path: LazyPath,
+     step_name: []const u8,
+     object_name: []const u8,
+ ) void {
+     const is_wasm = target.result.cpu.arch == .wasm32 or target.result.cpu.arch == .wasm64;
+-    const obj = b.addObject(.{ .strip = true, .pic = !is_wasm, .name = object_name, .root_source_file = main_path, .optimize = mode, .target = target, .use_llvm = true });
++
++    const obj_module = b.createModule(.{
++        .root_source_file = main_path,
++        .optimize = mode,
++        .target = target,
++        .pic = if (is_wasm) null else true,
++        .strip = true,
++        .stack_check = false,
++    });
++
++    const obj = b.addObject(.{
++        .name = object_name,
++        .root_module = obj_module,
++        .use_llvm = true,
++    });
+ 
+     obj.link_function_sections = true;
+-    obj.root_module.stack_check = false;
+ 
+     if (!is_wasm)
+         obj.bundle_compiler_rt = true;
+ 
+     const obj_file = obj.getEmittedBin();
+ 
+-    const suffix =
+-        if (target.result.os.tag == std.Target.Os.Tag.windows)
+-            "obj"
+-        else
+-            "o";
++    const suffix = if (target.result.os.tag == .windows) "obj" else "o";
+     const install = b.addInstallFile(obj_file, b.fmt("{s}.{s}", .{ object_name, suffix }));
+ 
+     const obj_step = b.step(step_name, "Build object file for linking");
+@@ -129,3 +168,81 @@ fn generateObjectFile(
+     obj_step.dependOn(&install.step);
+     b.getInstallStep().dependOn(obj_step);
+ }
++
++// SBF-specific versions that are only compiled when SBF is supported
++fn generateLlvmIrFileSbf(
++    b: *Build,
++    mode: std.builtin.OptimizeMode,
++    target: std.Build.ResolvedTarget,
++    main_path: LazyPath,
++    step_name: []const u8,
++    object_name: []const u8,
++) void {
++    if (!has_sbf_support) return;
++
++    const obj_module = b.createModule(.{
++        .root_source_file = main_path,
++        .optimize = mode,
++        .target = target,
++        .pic = null, // SBF doesn't use PIC
++        .strip = true,
++        .stack_check = false,
++    });
++
++    const obj = b.addObject(.{
++        .name = object_name,
++        .root_module = obj_module,
++        .use_llvm = true,
++    });
++
++    // No compiler_rt for SBF
++
++    _ = obj.getEmittedBin();
++    const ir_file = obj.getEmittedLlvmIr();
++    const bc_file = obj.getEmittedLlvmBc();
++    const install_ir = b.addInstallFile(ir_file, b.fmt("{s}.ll", .{object_name}));
++    const install_bc = b.addInstallFile(bc_file, b.fmt("{s}.bc", .{object_name}));
++
++    const ir = b.step(step_name, "Build LLVM ir");
++    ir.dependOn(&install_ir.step);
++    ir.dependOn(&install_bc.step);
++    b.getInstallStep().dependOn(ir);
++}
++
++fn generateObjectFileSbf(
++    b: *Build,
++    mode: std.builtin.OptimizeMode,
++    target: std.Build.ResolvedTarget,
++    main_path: LazyPath,
++    step_name: []const u8,
++    object_name: []const u8,
++) void {
++    if (!has_sbf_support) return;
++
++    const obj_module = b.createModule(.{
++        .root_source_file = main_path,
++        .optimize = mode,
++        .target = target,
++        .pic = null, // SBF doesn't use PIC
++        .strip = true,
++        .stack_check = false,
++    });
++
++    const obj = b.addObject(.{
++        .name = object_name,
++        .root_module = obj_module,
++        .use_llvm = true,
++    });
++
++    obj.link_function_sections = true;
++    // No compiler_rt for SBF
++
++    const obj_file = obj.getEmittedBin();
++
++    const install = b.addInstallFile(obj_file, b.fmt("{s}.o", .{object_name}));
++
++    const obj_step = b.step(step_name, "Build object file for linking");
++    obj_step.dependOn(&obj.step);
++    obj_step.dependOn(&install.step);
++    b.getInstallStep().dependOn(obj_step);
++}
+diff --git a/crates/compiler/builtins/bitcode/src/dbg.zig b/crates/compiler/builtins/bitcode/src/dbg.zig
+index 29004d7f37..04d43e9454 100644
+--- a/crates/compiler/builtins/bitcode/src/dbg.zig
++++ b/crates/compiler/builtins/bitcode/src/dbg.zig
+@@ -1,11 +1,13 @@
+ const std = @import("std");
+ const builtin = @import("builtin");
++const utils = @import("utils.zig");
+ const RocStr = @import("str.zig").RocStr;
+ 
+ // An optional debug impl to be called during `roc test`
+-pub fn dbg_impl(loc: *const RocStr, msg: *const RocStr, src: *const RocStr) callconv(.C) void {
+-    if (builtin.target.cpu.arch != .wasm32) {
+-        const stderr = std.io.getStdErr().writer();
+-        stderr.print("[{s}] {s} = {s}\n", .{ loc.asSlice(), src.asSlice(), msg.asSlice() }) catch unreachable;
++pub fn dbg_impl(loc: *const RocStr, msg: *const RocStr, src: *const RocStr) callconv(utils.cc) void {
++    // On wasm32 and Solana, std.debug.print is not available
++    if (builtin.target.cpu.arch != .wasm32 and !utils.is_solana) {
++        // Use std.debug.print for Zig 0.15 compatibility
++        std.debug.print("[{s}] {s} = {s}\n", .{ loc.asSlice(), src.asSlice(), msg.asSlice() });
+     }
+ }
+diff --git a/crates/compiler/builtins/bitcode/src/dec.zig b/crates/compiler/builtins/bitcode/src/dec.zig
+index f93eca695f..02d8feb8d1 100644
+--- a/crates/compiler/builtins/bitcode/src/dec.zig
++++ b/crates/compiler/builtins/bitcode/src/dec.zig
+@@ -10,6 +10,58 @@ const roc_panic = @import("panic.zig").panic_help;
+ const U256 = num_.U256;
+ const mul_u128 = num_.mul_u128;
+ 
++fn formatIntBuf(buf: []u8, value: anytype) usize {
++    if (comptime utils.is_solana) {
++        return formatIntBufSimple(buf, value);
++    } else {
++        const result = std.fmt.bufPrint(buf, "{d}", .{value}) catch unreachable;
++        return result.len;
++    }
++}
++
++fn formatIntBufSimple(buf: []u8, value: anytype) usize {
++    const T = @TypeOf(value);
++    var v = value;
++    var negative = false;
++
++    if (@typeInfo(T).int.signedness == .signed) {
++        if (v < 0) {
++            negative = true;
++            v = if (v == std.math.minInt(T)) blk: {
++                const abs_val = @as(@Type(.{ .int = .{ .signedness = .unsigned, .bits = @typeInfo(T).int.bits } }), @bitCast(v));
++                break :blk @intCast(abs_val);
++            } else -v;
++        }
++    }
++
++    var temp: [40]u8 = undefined;
++    var len: usize = 0;
++
++    if (v == 0) {
++        temp[len] = '0';
++        len += 1;
++    } else {
++        while (v > 0) {
++            temp[len] = @intCast('0' + @as(u8, @intCast(@mod(v, 10))));
++            v = @divTrunc(v, 10);
++            len += 1;
++        }
++    }
++
++    var pos: usize = 0;
++    if (negative) {
++        buf[pos] = '-';
++        pos += 1;
++    }
++
++    var i: usize = 0;
++    while (i < len) : (i += 1) {
++        buf[pos + i] = temp[len - 1 - i];
++    }
++
++    return pos + len;
++}
++
+ pub const RocDec = extern struct {
+     num: i128,
+ 
+@@ -93,12 +145,18 @@ pub const RocDec = extern struct {
+             const diff_decimal_places = decimal_places - after_str_len;
+ 
+             const after_str = roc_str_slice[pi + 1 .. length];
+-            const after_u64 = std.fmt.parseUnsigned(u64, after_str, 10) catch null;
++            const after_u64 = if (comptime utils.is_solana)
++                parseUnsignedSimple(u64, after_str, 10)
++            else
++                std.fmt.parseUnsigned(u64, after_str, 10) catch null;
+             after_val_i128 = if (after_u64) |f| @as(i128, @intCast(f)) * math.pow(i128, 10, diff_decimal_places) else null;
+         }
+ 
+         const before_str = roc_str_slice[initial_index..before_str_length];
+-        const before_val_not_adjusted = std.fmt.parseUnsigned(i128, before_str, 10) catch null;
++        const before_val_not_adjusted = if (comptime utils.is_solana)
++            parseUnsignedSimple(i128, before_str, 10)
++        else
++            std.fmt.parseUnsigned(i128, before_str, 10) catch null;
+ 
+         var before_val_i128: ?i128 = null;
+         if (before_val_not_adjusted) |before| {
+@@ -144,6 +202,33 @@ pub const RocDec = extern struct {
+         return (c -% 48) <= 9;
+     }
+ 
++    // Simple parseUnsigned for SBF that avoids std.fmt (which pulls in Writer with inline intrinsics)
++    fn parseUnsignedSimple(comptime T: type, slice: []const u8, radix: u8) ?T {
++        if (slice.len == 0) return null;
++
++        var result: T = 0;
++        for (slice) |c| {
++            const digit: u8 = if (c >= '0' and c <= '9')
++                c - '0'
++            else if (c >= 'a' and c <= 'z')
++                c - 'a' + 10
++            else if (c >= 'A' and c <= 'Z')
++                c - 'A' + 10
++            else
++                return null;
++
++            if (digit >= radix) return null;
++
++            // Check for overflow
++            const mul_result = @mulWithOverflow(result, @as(T, radix));
++            if (mul_result[1] == 1) return null;
++            const add_result = @addWithOverflow(mul_result[0], @as(T, digit));
++            if (add_result[1] == 1) return null;
++            result = add_result[0];
++        }
++        return result;
++    }
++
+     pub fn to_str(self: RocDec) RocStr {
+         // Special case
+         if (self.num == 0) {
+@@ -155,7 +240,7 @@ pub const RocDec = extern struct {
+ 
+         // Format the backing i128 into an array of digit (ascii) characters (u8s)
+         var digit_bytes_storage: [max_digits + 1]u8 = undefined;
+-        var num_digits = std.fmt.formatIntBuf(digit_bytes_storage[0..], num, 10, .lower, .{});
++        var num_digits = formatIntBuf(digit_bytes_storage[0..], num);
+         var digit_bytes: [*]u8 = digit_bytes_storage[0..];
+ 
+         // space where we assemble all the characters that make up the final string
+@@ -551,34 +636,66 @@ pub const RocDec = extern struct {
+     }
+ 
+     pub fn log(self: RocDec) RocDec {
+-        return fromF64(@log(self.toF64())).?;
++        if (comptime utils.is_solana) {
++            roc_panic("Decimal log not supported on Solana", 0);
++            return self;
++        } else {
++            return fromF64(@log(self.toF64())).?;
++        }
+     }
+ 
+-    // I belive the output of the trig functions is always in range of Dec.
+-    // If not, we probably should just make it saturate the Dec.
+-    // I don't think this should crash or return errors.
+     pub fn sin(self: RocDec) RocDec {
+-        return fromF64(math.sin(self.mod2pi().toF64())).?;
++        if (comptime utils.is_solana) {
++            roc_panic("Decimal sin not supported on Solana", 0);
++            return self;
++        } else {
++            return fromF64(math.sin(self.mod2pi().toF64())).?;
++        }
+     }
+ 
+     pub fn cos(self: RocDec) RocDec {
+-        return fromF64(math.cos(self.mod2pi().toF64())).?;
++        if (comptime utils.is_solana) {
++            roc_panic("Decimal cos not supported on Solana", 0);
++            return self;
++        } else {
++            return fromF64(math.cos(self.mod2pi().toF64())).?;
++        }
+     }
+ 
+     pub fn tan(self: RocDec) RocDec {
+-        return fromF64(math.tan(self.mod2pi().toF64())).?;
++        if (comptime utils.is_solana) {
++            roc_panic("Decimal tan not supported on Solana", 0);
++            return self;
++        } else {
++            return fromF64(math.tan(self.mod2pi().toF64())).?;
++        }
+     }
+ 
+     pub fn asin(self: RocDec) RocDec {
+-        return fromF64(math.asin(self.toF64())).?;
++        if (comptime utils.is_solana) {
++            roc_panic("Decimal asin not supported on Solana", 0);
++            return self;
++        } else {
++            return fromF64(math.asin(self.toF64())).?;
++        }
+     }
+ 
+     pub fn acos(self: RocDec) RocDec {
+-        return fromF64(math.acos(self.toF64())).?;
++        if (comptime utils.is_solana) {
++            roc_panic("Decimal acos not supported on Solana", 0);
++            return self;
++        } else {
++            return fromF64(math.acos(self.toF64())).?;
++        }
+     }
+ 
+     pub fn atan(self: RocDec) RocDec {
+-        return fromF64(math.atan(self.toF64())).?;
++        if (comptime utils.is_solana) {
++            roc_panic("Decimal atan not supported on Solana", 0);
++            return self;
++        } else {
++            return fromF64(math.atan(self.toF64())).?;
++        }
+     }
+ };
+ 
+@@ -1435,7 +1552,7 @@ test "pow: 0.5 ^ 2.0" {
+ 
+ // exports
+ 
+-pub fn fromStr(arg: RocStr) callconv(.C) num_.NumParseResult(i128) {
++pub fn fromStr(arg: RocStr) callconv(utils.cc) num_.NumParseResult(i128) {
+     if (@call(.always_inline, RocDec.fromStr, .{arg})) |dec| {
+         return .{ .errorcode = 0, .value = dec.num };
+     } else {
+@@ -1443,11 +1560,11 @@ pub fn fromStr(arg: RocStr) callconv(.C) num_.NumParseResult(i128) {
+     }
+ }
+ 
+-pub fn to_str(arg: RocDec) callconv(.C) RocStr {
++pub fn to_str(arg: RocDec) callconv(utils.cc) RocStr {
+     return @call(.always_inline, RocDec.to_str, .{arg});
+ }
+ 
+-pub fn fromF64C(arg: f64) callconv(.C) i128 {
++pub fn fromF64C(arg: f64) callconv(utils.cc) i128 {
+     if (@call(.always_inline, RocDec.fromF64, .{arg})) |dec| {
+         return dec.num;
+     } else {
+@@ -1455,7 +1572,7 @@ pub fn fromF64C(arg: f64) callconv(.C) i128 {
+     }
+ }
+ 
+-pub fn fromF32C(arg_f32: f32) callconv(.C) i128 {
++pub fn fromF32C(arg_f32: f32) callconv(utils.cc) i128 {
+     const arg_f64 = arg_f32;
+     if (@call(.always_inline, RocDec.fromF64, .{arg_f64})) |dec| {
+         return dec.num;
+@@ -1464,13 +1581,13 @@ pub fn fromF32C(arg_f32: f32) callconv(.C) i128 {
+     }
+ }
+ 
+-pub fn toF64(arg: RocDec) callconv(.C) f64 {
++pub fn toF64(arg: RocDec) callconv(utils.cc) f64 {
+     return @call(.always_inline, RocDec.toF64, .{arg});
+ }
+ 
+ pub fn exportFromInt(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(self: T) callconv(.C) i128 {
++        fn func(self: T) callconv(utils.cc) i128 {
+             const this = @as(i128, @intCast(self));
+ 
+             const answer = @mulWithOverflow(this, RocDec.one_point_zero_i128);
+@@ -1481,137 +1598,137 @@ pub fn exportFromInt(comptime T: type, comptime name: []const u8) void {
+             }
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+-pub fn fromU64C(arg: u64) callconv(.C) i128 {
++pub fn fromU64C(arg: u64) callconv(utils.cc) i128 {
+     return @call(.always_inline, RocDec.fromU64, .{arg}).toI128();
+ }
+ 
+-pub fn toI128(arg: RocDec) callconv(.C) i128 {
++pub fn toI128(arg: RocDec) callconv(utils.cc) i128 {
+     return @call(.always_inline, RocDec.toI128, .{arg});
+ }
+ 
+-pub fn fromI128(arg: i128) callconv(.C) RocDec {
++pub fn fromI128(arg: i128) callconv(utils.cc) RocDec {
+     return @call(.always_inline, RocDec.fromI128, .{arg});
+ }
+ 
+-pub fn eqC(arg1: RocDec, arg2: RocDec) callconv(.C) bool {
++pub fn eqC(arg1: RocDec, arg2: RocDec) callconv(utils.cc) bool {
+     return @call(.always_inline, RocDec.eq, .{ arg1, arg2 });
+ }
+ 
+-pub fn neqC(arg1: RocDec, arg2: RocDec) callconv(.C) bool {
++pub fn neqC(arg1: RocDec, arg2: RocDec) callconv(utils.cc) bool {
+     return @call(.always_inline, RocDec.neq, .{ arg1, arg2 });
+ }
+ 
+-pub fn negateC(arg: RocDec) callconv(.C) i128 {
++pub fn negateC(arg: RocDec) callconv(utils.cc) i128 {
+     return if (@call(.always_inline, RocDec.negate, .{arg})) |dec| dec.num else {
+         roc_panic("Decimal negation overflow!", 0);
+     };
+ }
+ 
+-pub fn absC(arg: RocDec) callconv(.C) i128 {
++pub fn absC(arg: RocDec) callconv(utils.cc) i128 {
+     const result = @call(.always_inline, RocDec.abs, .{arg}) catch {
+         roc_panic("Decimal absolute value overflow!", 0);
+     };
+     return result.num;
+ }
+ 
+-pub fn addC(arg1: RocDec, arg2: RocDec) callconv(.C) WithOverflow(RocDec) {
++pub fn addC(arg1: RocDec, arg2: RocDec) callconv(utils.cc) WithOverflow(RocDec) {
+     return @call(.always_inline, RocDec.addWithOverflow, .{ arg1, arg2 });
+ }
+ 
+-pub fn subC(arg1: RocDec, arg2: RocDec) callconv(.C) WithOverflow(RocDec) {
++pub fn subC(arg1: RocDec, arg2: RocDec) callconv(utils.cc) WithOverflow(RocDec) {
+     return @call(.always_inline, RocDec.subWithOverflow, .{ arg1, arg2 });
+ }
+ 
+-pub fn mulC(arg1: RocDec, arg2: RocDec) callconv(.C) WithOverflow(RocDec) {
++pub fn mulC(arg1: RocDec, arg2: RocDec) callconv(utils.cc) WithOverflow(RocDec) {
+     return @call(.always_inline, RocDec.mulWithOverflow, .{ arg1, arg2 });
+ }
+ 
+-pub fn divC(arg1: RocDec, arg2: RocDec) callconv(.C) i128 {
++pub fn divC(arg1: RocDec, arg2: RocDec) callconv(utils.cc) i128 {
+     return @call(.always_inline, RocDec.div, .{ arg1, arg2 }).num;
+ }
+ 
+-pub fn logC(arg: RocDec) callconv(.C) i128 {
++pub fn logC(arg: RocDec) callconv(utils.cc) i128 {
+     return @call(.always_inline, RocDec.log, .{arg}).num;
+ }
+ 
+-pub fn powC(arg1: RocDec, arg2: RocDec) callconv(.C) i128 {
++pub fn powC(arg1: RocDec, arg2: RocDec) callconv(utils.cc) i128 {
+     return @call(.always_inline, RocDec.pow, .{ arg1, arg2 }).num;
+ }
+ 
+-pub fn sinC(arg: RocDec) callconv(.C) i128 {
++pub fn sinC(arg: RocDec) callconv(utils.cc) i128 {
+     return @call(.always_inline, RocDec.sin, .{arg}).num;
+ }
+ 
+-pub fn cosC(arg: RocDec) callconv(.C) i128 {
++pub fn cosC(arg: RocDec) callconv(utils.cc) i128 {
+     return @call(.always_inline, RocDec.cos, .{arg}).num;
+ }
+ 
+-pub fn tanC(arg: RocDec) callconv(.C) i128 {
++pub fn tanC(arg: RocDec) callconv(utils.cc) i128 {
+     return @call(.always_inline, RocDec.tan, .{arg}).num;
+ }
+ 
+-pub fn asinC(arg: RocDec) callconv(.C) i128 {
++pub fn asinC(arg: RocDec) callconv(utils.cc) i128 {
+     return @call(.always_inline, RocDec.asin, .{arg}).num;
+ }
+ 
+-pub fn acosC(arg: RocDec) callconv(.C) i128 {
++pub fn acosC(arg: RocDec) callconv(utils.cc) i128 {
+     return @call(.always_inline, RocDec.acos, .{arg}).num;
+ }
+ 
+-pub fn atanC(arg: RocDec) callconv(.C) i128 {
++pub fn atanC(arg: RocDec) callconv(utils.cc) i128 {
+     return @call(.always_inline, RocDec.atan, .{arg}).num;
+ }
+ 
+-pub fn addOrPanicC(arg1: RocDec, arg2: RocDec) callconv(.C) RocDec {
++pub fn addOrPanicC(arg1: RocDec, arg2: RocDec) callconv(utils.cc) RocDec {
+     return @call(.always_inline, RocDec.add, .{ arg1, arg2 });
+ }
+ 
+-pub fn addSaturatedC(arg1: RocDec, arg2: RocDec) callconv(.C) RocDec {
++pub fn addSaturatedC(arg1: RocDec, arg2: RocDec) callconv(utils.cc) RocDec {
+     return @call(.always_inline, RocDec.addSaturated, .{ arg1, arg2 });
+ }
+ 
+-pub fn subOrPanicC(arg1: RocDec, arg2: RocDec) callconv(.C) RocDec {
++pub fn subOrPanicC(arg1: RocDec, arg2: RocDec) callconv(utils.cc) RocDec {
+     return @call(.always_inline, RocDec.sub, .{ arg1, arg2 });
+ }
+ 
+-pub fn subSaturatedC(arg1: RocDec, arg2: RocDec) callconv(.C) RocDec {
++pub fn subSaturatedC(arg1: RocDec, arg2: RocDec) callconv(utils.cc) RocDec {
+     return @call(.always_inline, RocDec.subSaturated, .{ arg1, arg2 });
+ }
+ 
+-pub fn mulOrPanicC(arg1: RocDec, arg2: RocDec) callconv(.C) RocDec {
++pub fn mulOrPanicC(arg1: RocDec, arg2: RocDec) callconv(utils.cc) RocDec {
+     return @call(.always_inline, RocDec.mul, .{ arg1, arg2 });
+ }
+ 
+-pub fn mulSaturatedC(arg1: RocDec, arg2: RocDec) callconv(.C) RocDec {
++pub fn mulSaturatedC(arg1: RocDec, arg2: RocDec) callconv(utils.cc) RocDec {
+     return @call(.always_inline, RocDec.mulSaturated, .{ arg1, arg2 });
+ }
+ 
+ pub fn exportRound(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(input: RocDec) callconv(.C) T {
++        fn func(input: RocDec) callconv(utils.cc) T {
+             return @as(T, @intCast(@divFloor(input.round().num, RocDec.one_point_zero_i128)));
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportFloor(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(input: RocDec) callconv(.C) T {
++        fn func(input: RocDec) callconv(utils.cc) T {
+             return @as(T, @intCast(@divFloor(input.floor().num, RocDec.one_point_zero_i128)));
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportCeiling(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(input: RocDec) callconv(.C) T {
++        fn func(input: RocDec) callconv(utils.cc) T {
+             return @as(T, @intCast(@divFloor(input.ceiling().num, RocDec.one_point_zero_i128)));
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+diff --git a/crates/compiler/builtins/bitcode/src/expect.zig b/crates/compiler/builtins/bitcode/src/expect.zig
+index 1fcdd3ee98..8b5a681da2 100644
+--- a/crates/compiler/builtins/bitcode/src/expect.zig
++++ b/crates/compiler/builtins/bitcode/src/expect.zig
+@@ -1,5 +1,6 @@
+ const std = @import("std");
+ const builtin = @import("builtin");
++const utils = @import("utils.zig");
+ 
+ const Atomic = std.atomic.Value;
+ 
+@@ -12,18 +13,18 @@ pub const MAP_SHARED: c_int = 0x0001;
+ // IMPORTANT: shared memory object names must begin with / and contain no other slashes!
+ var SHARED_BUFFER: []u8 = undefined;
+ 
+-pub fn setSharedBuffer(ptr: [*]u8, length: usize) callconv(.C) usize {
++pub fn setSharedBuffer(ptr: [*]u8, length: usize) callconv(utils.cc) usize {
+     SHARED_BUFFER = ptr[0..length];
+ 
+     // the rust side expects that a pointer is returned
+     return 0;
+ }
+ 
+-pub fn expectFailedStartSharedBuffer() callconv(.C) [*]u8 {
++pub fn expectFailedStartSharedBuffer() callconv(utils.cc) [*]u8 {
+     return SHARED_BUFFER.ptr;
+ }
+ 
+-pub fn expectFailedStartSharedFile() callconv(.C) [*]u8 {
++pub fn expectFailedStartSharedFile() callconv(utils.cc) [*]u8 {
+     // IMPORTANT: shared memory object names must begin with / and contain no other slashes!
+     var name: [100]u8 = undefined;
+     _ = std.fmt.bufPrint(name[0..100], "/roc_expect_buffer_{}\x00", .{roc_getppid()}) catch unreachable;
+@@ -54,7 +55,7 @@ extern fn roc_shm_open(name: *const i8, oflag: c_int, mode: c_uint) c_int;
+ extern fn roc_mmap(addr: ?*anyopaque, length: c_uint, prot: c_int, flags: c_int, fd: c_int, offset: c_uint) *anyopaque;
+ extern fn roc_getppid() c_int;
+ 
+-pub fn readSharedBufferEnv() callconv(.C) void {
++pub fn readSharedBufferEnv() callconv(utils.cc) void {
+     if (builtin.os.tag == .macos or builtin.os.tag == .linux) {
+ 
+         // IMPORTANT: shared memory object names must begin with / and contain no other slashes!
+@@ -79,7 +80,7 @@ pub fn readSharedBufferEnv() callconv(.C) void {
+     }
+ }
+ 
+-pub fn notifyParent(shared_buffer: [*]u8, tag: u32) callconv(.C) void {
++pub fn notifyParent(shared_buffer: [*]u8, tag: u32) callconv(utils.cc) void {
+     if (builtin.os.tag == .macos or builtin.os.tag == .linux) {
+         const usize_ptr = @as([*]u32, @ptrCast(@alignCast(shared_buffer)));
+         const atomic_ptr = @as(*Atomic(u32), @ptrCast(&usize_ptr[5]));
+@@ -92,6 +93,6 @@ pub fn notifyParent(shared_buffer: [*]u8, tag: u32) callconv(.C) void {
+     }
+ }
+ 
+-pub fn notifyParentExpect(shared_buffer: [*]u8) callconv(.C) void {
++pub fn notifyParentExpect(shared_buffer: [*]u8) callconv(utils.cc) void {
+     notifyParent(shared_buffer, 1);
+ }
+diff --git a/crates/compiler/builtins/bitcode/src/fuzz_sort.zig b/crates/compiler/builtins/bitcode/src/fuzz_sort.zig
+index b1581aa2e6..dbaf21b32a 100644
+--- a/crates/compiler/builtins/bitcode/src/fuzz_sort.zig
++++ b/crates/compiler/builtins/bitcode/src/fuzz_sort.zig
+@@ -1,16 +1,17 @@
+ const std = @import("std");
++const utils = @import("utils.zig");
+ const sort = @import("sort.zig");
+ 
+-extern fn malloc(size: usize) callconv(.C) ?*anyopaque;
+-extern fn free(c_ptr: *anyopaque) callconv(.C) void;
++extern fn malloc(size: usize) callconv(utils.cc) ?*anyopaque;
++extern fn free(c_ptr: *anyopaque) callconv(utils.cc) void;
+ 
+-fn cMain() callconv(.C) i32 {
++fn cMain() callconv(utils.cc) i32 {
+     fuzz_main() catch unreachable;
+     return 0;
+ }
+ 
+ comptime {
+-    @export(cMain, .{ .name = "main", .linkage = .Strong });
++    @export(&cMain, .{ .name = "main", .linkage = .Strong });
+ }
+ 
+ const DEBUG = false;
+@@ -48,7 +49,7 @@ pub fn fuzz_main() !void {
+ }
+ 
+ const Opaque = ?[*]u8;
+-fn test_i64_compare_refcounted(count_ptr: Opaque, a_ptr: Opaque, b_ptr: Opaque) callconv(.C) u8 {
++fn test_i64_compare_refcounted(count_ptr: Opaque, a_ptr: Opaque, b_ptr: Opaque) callconv(utils.cc) u8 {
+     const a = @as(*i64, @alignCast(@ptrCast(a_ptr))).*;
+     const b = @as(*i64, @alignCast(@ptrCast(b_ptr))).*;
+ 
+@@ -63,21 +64,21 @@ fn test_i64_compare_refcounted(count_ptr: Opaque, a_ptr: Opaque, b_ptr: Opaque)
+     return lt + lt + gt;
+ }
+ 
+-fn test_i64_copy(dst_ptr: Opaque, src_ptr: Opaque) callconv(.C) void {
++fn test_i64_copy(dst_ptr: Opaque, src_ptr: Opaque) callconv(utils.cc) void {
+     @as(*i64, @alignCast(@ptrCast(dst_ptr))).* = @as(*i64, @alignCast(@ptrCast(src_ptr))).*;
+ }
+ 
+-fn test_inc_n_data(count_ptr: Opaque, n: usize) callconv(.C) void {
++fn test_inc_n_data(count_ptr: Opaque, n: usize) callconv(utils.cc) void {
+     @as(*isize, @ptrCast(@alignCast(count_ptr))).* += @intCast(n);
+ }
+ 
+ comptime {
+-    @export(testing_roc_alloc, .{ .name = "roc_alloc", .linkage = .Strong });
+-    @export(testing_roc_dealloc, .{ .name = "roc_dealloc", .linkage = .Strong });
+-    @export(testing_roc_panic, .{ .name = "roc_panic", .linkage = .Strong });
++    @export(&testing_roc_alloc, .{ .name = "roc_alloc", .linkage = .Strong });
++    @export(&testing_roc_dealloc, .{ .name = "roc_dealloc", .linkage = .Strong });
++    @export(&testing_roc_panic, .{ .name = "roc_panic", .linkage = .Strong });
+ }
+ 
+-fn testing_roc_alloc(size: usize, _: u32) callconv(.C) ?*anyopaque {
++fn testing_roc_alloc(size: usize, _: u32) callconv(utils.cc) ?*anyopaque {
+     // We store an extra usize which is the size of the full allocation.
+     const full_size = size + @sizeOf(usize);
+     var raw_ptr = (allocator.alloc(u8, full_size) catch unreachable).ptr;
+@@ -86,14 +87,14 @@ fn testing_roc_alloc(size: usize, _: u32) callconv(.C) ?*anyopaque {
+     return @as(?*anyopaque, @ptrCast(raw_ptr));
+ }
+ 
+-fn testing_roc_dealloc(c_ptr: *anyopaque, _: u32) callconv(.C) void {
++fn testing_roc_dealloc(c_ptr: *anyopaque, _: u32) callconv(utils.cc) void {
+     const raw_ptr = @as([*]u8, @ptrCast(c_ptr)) - @sizeOf(usize);
+     const full_size = @as([*]usize, @alignCast(@ptrCast(raw_ptr)))[0];
+     const slice = raw_ptr[0..full_size];
+     allocator.free(slice);
+ }
+ 
+-fn testing_roc_panic(c_ptr: *anyopaque, tag_id: u32) callconv(.C) void {
++fn testing_roc_panic(c_ptr: *anyopaque, tag_id: u32) callconv(utils.cc) void {
+     _ = c_ptr;
+     _ = tag_id;
+ 
+diff --git a/crates/compiler/builtins/bitcode/src/hash.zig b/crates/compiler/builtins/bitcode/src/hash.zig
+index cb67609342..b5953ce518 100644
+--- a/crates/compiler/builtins/bitcode/src/hash.zig
++++ b/crates/compiler/builtins/bitcode/src/hash.zig
+@@ -4,10 +4,11 @@
+ // The MIT license requires this copyright notice to be included in all copies
+ // and substantial portions of the software.
+ const std = @import("std");
++const utils = @import("utils.zig");
+ const str = @import("str.zig");
+ const mem = std.mem;
+ 
+-pub fn wyhash(seed: u64, bytes: ?[*]const u8, length: usize) callconv(.C) u64 {
++pub fn wyhash(seed: u64, bytes: ?[*]const u8, length: usize) callconv(utils.cc) u64 {
+     if (bytes) |nonnull| {
+         const slice = nonnull[0..length];
+         return wyhash_hash(seed, slice);
+@@ -16,7 +17,7 @@ pub fn wyhash(seed: u64, bytes: ?[*]const u8, length: usize) callconv(.C) u64 {
+     }
+ }
+ 
+-pub fn wyhash_rocstr(seed: u64, input: str.RocStr) callconv(.C) u64 {
++pub fn wyhash_rocstr(seed: u64, input: str.RocStr) callconv(utils.cc) u64 {
+     return wyhash_hash(seed, input.asSlice());
+ }
+ 
+diff --git a/crates/compiler/builtins/bitcode/src/list.zig b/crates/compiler/builtins/bitcode/src/list.zig
+index b461dd74ce..cecc3ff838 100644
+--- a/crates/compiler/builtins/bitcode/src/list.zig
++++ b/crates/compiler/builtins/bitcode/src/list.zig
+@@ -1,7 +1,9 @@
+ const std = @import("std");
++const builtin = @import("builtin");
+ const utils = @import("utils.zig");
+ const str = @import("str.zig");
+-const sort = @import("sort.zig");
++// Sort is excluded on SBF due to stack size constraints (Solana has 4KB stack limit)
++const sort = if (!utils.is_solana) @import("sort.zig") else struct {};
+ const UpdateMode = utils.UpdateMode;
+ const mem = std.mem;
+ const math = std.math;
+@@ -10,14 +12,14 @@ const expect = std.testing.expect;
+ const expectEqual = std.testing.expectEqual;
+ 
+ const Opaque = ?[*]u8;
+-const EqFn = *const fn (Opaque, Opaque) callconv(.C) bool;
+-const CompareFn = *const fn (Opaque, Opaque, Opaque) callconv(.C) u8;
+-const CopyFn = *const fn (Opaque, Opaque) callconv(.C) void;
++const EqFn = *const fn (Opaque, Opaque) callconv(utils.cc) bool;
++const CompareFn = *const fn (Opaque, Opaque, Opaque) callconv(utils.cc) u8;
++const CopyFn = *const fn (Opaque, Opaque) callconv(utils.cc) void;
+ 
+-const Inc = *const fn (?[*]u8) callconv(.C) void;
+-const IncN = *const fn (?[*]u8, usize) callconv(.C) void;
+-const Dec = *const fn (?[*]u8) callconv(.C) void;
+-const HasTagId = *const fn (u16, ?[*]u8) callconv(.C) extern struct { matched: bool, data: ?[*]u8 };
++const Inc = *const fn (?[*]u8) callconv(utils.cc) void;
++const IncN = *const fn (?[*]u8, usize) callconv(utils.cc) void;
++const Dec = *const fn (?[*]u8) callconv(utils.cc) void;
++const HasTagId = *const fn (u16, ?[*]u8) callconv(utils.cc) extern struct { matched: bool, data: ?[*]u8 };
+ 
+ const SEAMLESS_SLICE_BIT: usize =
+     @as(usize, @bitCast(@as(isize, std.math.minInt(isize))));
+@@ -99,7 +101,7 @@ pub const RocList = extern struct {
+             const src = @as([*]const u8, @ptrCast(slice.ptr));
+             const num_bytes = slice.len * @sizeOf(T);
+ 
+-            @memcpy(dest[0..num_bytes], src[0..num_bytes]);
++            utils.memcpy(dest[0..num_bytes], src[0..num_bytes]);
+         }
+ 
+         return list;
+@@ -138,7 +140,7 @@ pub const RocList = extern struct {
+         if (elements_refcounted and !self.isSeamlessSlice()) {
+             // - 1 is refcount.
+             // - 2 is size on heap.
+-            const ptr = @as([*]usize, @alignCast(@ptrCast(self.getAllocationDataPtr()))) - 2;
++            const ptr = @as([*]usize, @ptrCast(@alignCast(self.getAllocationDataPtr()))) - 2;
+             ptr[0] = self.length;
+         }
+     }
+@@ -149,7 +151,7 @@ pub const RocList = extern struct {
+             if (self.getAllocationDataPtr()) |source| {
+                 // - 1 is refcount.
+                 // - 2 is size on heap.
+-                const ptr = @as([*]usize, @alignCast(@ptrCast(source))) - 2;
++                const ptr = @as([*]usize, @ptrCast(@alignCast(source))) - 2;
+                 ptr[0] = self.length;
+             }
+         }
+@@ -226,7 +228,7 @@ pub const RocList = extern struct {
+         var new_bytes: [*]u8 = @as([*]u8, @ptrCast(new_list.bytes));
+ 
+         const number_of_bytes = self.len() * element_width;
+-        @memcpy(new_bytes[0..number_of_bytes], old_bytes[0..number_of_bytes]);
++        utils.memcpy(new_bytes[0..number_of_bytes], old_bytes[0..number_of_bytes]);
+ 
+         // Increment refcount of all elements now in a new list.
+         if (elements_refcounted) {
+@@ -319,8 +321,8 @@ pub const RocList = extern struct {
+             // transfer the memory
+             const dest_ptr = result.bytes orelse unreachable;
+ 
+-            @memcpy(dest_ptr[0..(old_length * element_width)], source_ptr[0..(old_length * element_width)]);
+-            @memset(dest_ptr[(old_length * element_width)..(new_length * element_width)], 0);
++            utils.memcpy(dest_ptr[0..(old_length * element_width)], source_ptr[0..(old_length * element_width)]);
++            utils.memset(dest_ptr[(old_length * element_width)..(new_length * element_width)], 0);
+ 
+             // Increment refcount of all elements now in a new list.
+             if (elements_refcounted) {
+@@ -338,11 +340,11 @@ pub const RocList = extern struct {
+     }
+ };
+ 
+-pub fn listIncref(list: RocList, amount: isize, elements_refcounted: bool) callconv(.C) void {
++pub fn listIncref(list: RocList, amount: isize, elements_refcounted: bool) callconv(utils.cc) void {
+     list.incref(amount, elements_refcounted);
+ }
+ 
+-pub fn listDecref(list: RocList, alignment: u32, element_width: usize, elements_refcounted: bool, dec: Dec) callconv(.C) void {
++pub fn listDecref(list: RocList, alignment: u32, element_width: usize, elements_refcounted: bool, dec: Dec) callconv(utils.cc) void {
+     list.decref(alignment, element_width, elements_refcounted, dec);
+ }
+ 
+@@ -352,7 +354,7 @@ pub fn listWithCapacity(
+     element_width: usize,
+     elements_refcounted: bool,
+     inc: Inc,
+-) callconv(.C) RocList {
++) callconv(utils.cc) RocList {
+     return listReserve(RocList.empty(), alignment, capacity, element_width, elements_refcounted, inc, .InPlace);
+ }
+ 
+@@ -364,7 +366,7 @@ pub fn listReserve(
+     elements_refcounted: bool,
+     inc: Inc,
+     update_mode: UpdateMode,
+-) callconv(.C) RocList {
++) callconv(utils.cc) RocList {
+     const original_len = list.len();
+     const cap = @as(u64, @intCast(list.getCapacity()));
+     const desired_cap = @as(u64, @intCast(original_len)) +| spare;
+@@ -389,7 +391,7 @@ pub fn listReleaseExcessCapacity(
+     inc: Inc,
+     dec: Dec,
+     update_mode: UpdateMode,
+-) callconv(.C) RocList {
++) callconv(utils.cc) RocList {
+     const old_length = list.len();
+     // We use the direct list.capacity_or_alloc_ptr to make sure both that there is no extra capacity and that it isn't a seamless slice.
+     if ((update_mode == .InPlace or list.isUnique()) and list.capacity_or_alloc_ptr == old_length) {
+@@ -406,7 +408,7 @@ pub fn listReleaseExcessCapacity(
+         if (list.bytes) |source_ptr| {
+             const dest_ptr = output.bytes orelse unreachable;
+ 
+-            @memcpy(dest_ptr[0..(old_length * element_width)], source_ptr[0..(old_length * element_width)]);
++            utils.memcpy(dest_ptr[0..(old_length * element_width)], source_ptr[0..(old_length * element_width)]);
+             if (elements_refcounted) {
+                 var i: usize = 0;
+                 while (i < old_length) : (i += 1) {
+@@ -425,7 +427,7 @@ pub fn listAppendUnsafe(
+     element: Opaque,
+     element_width: usize,
+     copy: CopyFn,
+-) callconv(.C) RocList {
++) callconv(utils.cc) RocList {
+     const old_length = list.len();
+     var output = list;
+     output.length += 1;
+@@ -449,7 +451,7 @@ fn listAppend(
+     inc: Inc,
+     update_mode: UpdateMode,
+     copy: CopyFn,
+-) callconv(.C) RocList {
++) callconv(utils.cc) RocList {
+     const with_capacity = listReserve(list, alignment, 1, element_width, elements_refcounted, inc, update_mode);
+     return listAppendUnsafe(with_capacity, element, element_width, copy);
+ }
+@@ -462,7 +464,7 @@ pub fn listPrepend(
+     elements_refcounted: bool,
+     inc: Inc,
+     copy: CopyFn,
+-) callconv(.C) RocList {
++) callconv(utils.cc) RocList {
+     const old_length = list.len();
+     // TODO: properly wire in update mode.
+     var with_capacity = listReserve(list, alignment, 1, element_width, elements_refcounted, inc, .Immutable);
+@@ -495,7 +497,7 @@ pub fn listSwap(
+     dec: Dec,
+     update_mode: UpdateMode,
+     copy: CopyFn,
+-) callconv(.C) RocList {
++) callconv(utils.cc) RocList {
+     // Early exit to avoid swapping the same element.
+     if (index_1 == index_2)
+         return list;
+@@ -517,9 +519,9 @@ pub fn listSwap(
+     const source_ptr = @as([*]u8, @ptrCast(newList.bytes));
+ 
+     swapElements(source_ptr, element_width, @as(usize,
+-    // We already verified that both indices are less than the stored list length,
+-    // which is usize, so casting them to usize will definitely be lossless.
+-    @intCast(index_1)), @as(usize, @intCast(index_2)), copy);
++        // We already verified that both indices are less than the stored list length,
++        // which is usize, so casting them to usize will definitely be lossless.
++        @intCast(index_1)), @as(usize, @intCast(index_2)), copy);
+ 
+     return newList;
+ }
+@@ -532,7 +534,7 @@ pub fn listSublist(
+     start_u64: u64,
+     len_u64: u64,
+     dec: Dec,
+-) callconv(.C) RocList {
++) callconv(utils.cc) RocList {
+     const size = list.len();
+     if (size == 0 or len_u64 == 0 or start_u64 >= @as(u64, @intCast(size))) {
+         if (list.isUnique()) {
+@@ -611,7 +613,7 @@ pub fn listDropAt(
+     drop_index_u64: u64,
+     inc: Inc,
+     dec: Dec,
+-) callconv(.C) RocList {
++) callconv(utils.cc) RocList {
+     const size = list.len();
+     const size_u64 = @as(u64, @intCast(size));
+ 
+@@ -665,12 +667,12 @@ pub fn listDropAt(
+         const target_ptr = output.bytes orelse unreachable;
+ 
+         const head_size = drop_index * element_width;
+-        @memcpy(target_ptr[0..head_size], source_ptr[0..head_size]);
++        utils.memcpy(target_ptr[0..head_size], source_ptr[0..head_size]);
+ 
+         const tail_target = target_ptr + drop_index * element_width;
+         const tail_source = source_ptr + (drop_index + 1) * element_width;
+         const tail_size = (size - drop_index - 1) * element_width;
+-        @memcpy(tail_target[0..tail_size], tail_source[0..tail_size]);
++        utils.memcpy(tail_target[0..tail_size], tail_source[0..tail_size]);
+ 
+         if (elements_refcounted) {
+             var i: usize = 0;
+@@ -700,7 +702,14 @@ pub fn listSortWith(
+     inc: Inc,
+     dec: Dec,
+     copy: CopyFn,
+-) callconv(.C) RocList {
++) callconv(utils.cc) RocList {
++    // Sort is not available on Solana (SBF) due to stack size constraints
++    if (utils.is_solana) {
++        // On Solana, just return the input unsorted
++        // TODO: Implement a stack-efficient sort for Solana
++        return input;
++    }
++
+     if (input.len() < 2) {
+         return input;
+     }
+@@ -739,14 +748,14 @@ fn swap(
+     var ptr2 = p2;
+     while (true) {
+         if (width < threshold) {
+-            @memcpy(buffer[0..width], ptr1[0..width]);
+-            @memcpy(ptr1[0..width], ptr2[0..width]);
+-            @memcpy(ptr2[0..width], buffer[0..width]);
++            utils.memcpy(buffer[0..width], ptr1[0..width]);
++            utils.memcpy(ptr1[0..width], ptr2[0..width]);
++            utils.memcpy(ptr2[0..width], buffer[0..width]);
+             return;
+         } else {
+-            @memcpy(buffer[0..threshold], ptr1[0..threshold]);
+-            @memcpy(ptr1[0..threshold], ptr2[0..threshold]);
+-            @memcpy(ptr2[0..threshold], buffer[0..threshold]);
++            utils.memcpy(buffer[0..threshold], ptr1[0..threshold]);
++            utils.memcpy(ptr1[0..threshold], ptr2[0..threshold]);
++            utils.memcpy(ptr2[0..threshold], buffer[0..threshold]);
+ 
+             ptr1 += threshold;
+             ptr2 += threshold;
+@@ -777,7 +786,7 @@ pub fn listConcat(
+     elements_refcounted: bool,
+     inc: Inc,
+     dec: Dec,
+-) callconv(.C) RocList {
++) callconv(utils.cc) RocList {
+     // NOTE we always use list_a! because it is owned, we must consume it, and it may have unused capacity
+     if (list_b.isEmpty()) {
+         if (list_a.getCapacity() == 0) {
+@@ -798,7 +807,7 @@ pub fn listConcat(
+         // These must exist, otherwise, the lists would have been empty.
+         const source_a = resized_list_a.bytes orelse unreachable;
+         const source_b = list_b.bytes orelse unreachable;
+-        @memcpy(source_a[(list_a.len() * element_width)..(total_length * element_width)], source_b[0..(list_b.len() * element_width)]);
++        utils.memcpy(source_a[(list_a.len() * element_width)..(total_length * element_width)], source_b[0..(list_b.len() * element_width)]);
+ 
+         // Increment refcount of all cloned elements.
+         if (elements_refcounted) {
+@@ -828,7 +837,7 @@ pub fn listConcat(
+         const byte_count_a = list_a.len() * element_width;
+         const byte_count_b = list_b.len() * element_width;
+         mem.copyBackwards(u8, source_b[byte_count_a .. byte_count_a + byte_count_b], source_b[0..byte_count_b]);
+-        @memcpy(source_b[0..byte_count_a], source_a[0..byte_count_a]);
++        utils.memcpy(source_b[0..byte_count_a], source_a[0..byte_count_a]);
+ 
+         // Increment refcount of all cloned elements.
+         if (elements_refcounted) {
+@@ -853,8 +862,8 @@ pub fn listConcat(
+     const source_a = list_a.bytes orelse unreachable;
+     const source_b = list_b.bytes orelse unreachable;
+ 
+-    @memcpy(target[0..(list_a.len() * element_width)], source_a[0..(list_a.len() * element_width)]);
+-    @memcpy(target[(list_a.len() * element_width)..(total_length * element_width)], source_b[0..(list_b.len() * element_width)]);
++    utils.memcpy(target[0..(list_a.len() * element_width)], source_a[0..(list_a.len() * element_width)]);
++    utils.memcpy(target[(list_a.len() * element_width)..(total_length * element_width)], source_b[0..(list_b.len() * element_width)]);
+ 
+     // Increment refcount of all cloned elements.
+     if (elements_refcounted) {
+@@ -884,7 +893,7 @@ pub fn listReplaceInPlace(
+     element_width: usize,
+     out_element: ?[*]u8,
+     copy: CopyFn,
+-) callconv(.C) RocList {
++) callconv(utils.cc) RocList {
+     // INVARIANT: bounds checking happens on the roc side
+     //
+     // at the time of writing, the function is implemented roughly as
+@@ -906,7 +915,7 @@ pub fn listReplace(
+     dec: Dec,
+     out_element: ?[*]u8,
+     copy: CopyFn,
+-) callconv(.C) RocList {
++) callconv(utils.cc) RocList {
+     // INVARIANT: bounds checking happens on the roc side
+     //
+     // at the time of writing, the function is implemented roughly as
+@@ -940,7 +949,7 @@ inline fn listReplaceInPlaceHelp(
+ 
+ pub fn listIsUnique(
+     list: RocList,
+-) callconv(.C) bool {
++) callconv(utils.cc) bool {
+     return list.isEmpty() or list.isUnique();
+ }
+ 
+@@ -951,23 +960,23 @@ pub fn listClone(
+     elements_refcounted: bool,
+     inc: Inc,
+     dec: Dec,
+-) callconv(.C) RocList {
++) callconv(utils.cc) RocList {
+     return list.makeUnique(alignment, element_width, elements_refcounted, inc, dec);
+ }
+ 
+ pub fn listCapacity(
+     list: RocList,
+-) callconv(.C) usize {
++) callconv(utils.cc) usize {
+     return list.getCapacity();
+ }
+ 
+ pub fn listAllocationPtr(
+     list: RocList,
+-) callconv(.C) ?[*]u8 {
++) callconv(utils.cc) ?[*]u8 {
+     return list.getAllocationDataPtr();
+ }
+ 
+-fn rcNone(_: ?[*]u8) callconv(.C) void {}
++fn rcNone(_: ?[*]u8) callconv(utils.cc) void {}
+ 
+ test "listConcat: non-unique with unique overlapping" {
+     var nonUnique = RocList.fromSlice(u8, ([_]u8{1})[0..], false);
+@@ -990,7 +999,7 @@ test "listConcat: non-unique with unique overlapping" {
+ pub fn listConcatUtf8(
+     list: RocList,
+     string: str.RocStr,
+-) callconv(.C) RocList {
++) callconv(utils.cc) RocList {
+     if (string.len() == 0) {
+         return list;
+     } else {
+@@ -1000,7 +1009,7 @@ pub fn listConcatUtf8(
+         const result = list.reallocate(1, combined_length, 1, false, &rcNone);
+         // We just allocated combined_length, which is > 0 because string.len() > 0
+         var bytes = result.bytes orelse unreachable;
+-        @memcpy(bytes[list.len()..combined_length], string.asU8ptr()[0..string.len()]);
++        utils.memcpy(bytes[list.len()..combined_length], string.asU8ptr()[0..string.len()]);
+ 
+         return result;
+     }
+diff --git a/crates/compiler/builtins/bitcode/src/main.zig b/crates/compiler/builtins/bitcode/src/main.zig
+index 5d3dc77064..c11d523d04 100644
+--- a/crates/compiler/builtins/bitcode/src/main.zig
++++ b/crates/compiler/builtins/bitcode/src/main.zig
+@@ -13,45 +13,44 @@ const STR = "str";
+ // Dec Module
+ const dec = @import("dec.zig");
+ 
+-var FLTUSED: i32 = 0;
+-comptime {
+-    if (builtin.os.tag == .windows) {
+-        @export(FLTUSED, .{ .name = "_fltused", .linkage = .weak });
+-    }
+-}
++// Note: _fltused is already exported by Zig's compiler_rt for Windows
++// so we don't need to export it again
+ 
+ comptime {
+     exportDecFn(dec.absC, "abs");
+-    exportDecFn(dec.acosC, "acos");
+     exportDecFn(dec.addC, "add_with_overflow");
+     exportDecFn(dec.addOrPanicC, "add_or_panic");
+     exportDecFn(dec.addSaturatedC, "add_saturated");
+-    exportDecFn(dec.asinC, "asin");
+-    exportDecFn(dec.atanC, "atan");
+-    exportDecFn(dec.cosC, "cos");
+     exportDecFn(dec.divC, "div");
+     exportDecFn(dec.eqC, "eq");
+     exportDecFn(dec.fromF32C, "from_float.f32");
+     exportDecFn(dec.fromF64C, "from_float.f64");
+     exportDecFn(dec.fromStr, "from_str");
+     exportDecFn(dec.fromU64C, "from_u64");
+-    exportDecFn(dec.logC, "log");
+-    exportDecFn(dec.powC, "pow");
+     exportDecFn(dec.mulC, "mul_with_overflow");
+     exportDecFn(dec.mulOrPanicC, "mul_or_panic");
+     exportDecFn(dec.mulSaturatedC, "mul_saturated");
+     exportDecFn(dec.negateC, "negate");
+     exportDecFn(dec.neqC, "neq");
+-    exportDecFn(dec.sinC, "sin");
+     exportDecFn(dec.subC, "sub_with_overflow");
+     exportDecFn(dec.subOrPanicC, "sub_or_panic");
+     exportDecFn(dec.subSaturatedC, "sub_saturated");
+-    exportDecFn(dec.tanC, "tan");
+     exportDecFn(dec.toF64, "to_f64");
+     exportDecFn(dec.toI128, "to_i128");
+     exportDecFn(dec.fromI128, "from_i128");
+     exportDecFn(dec.to_str, "to_str");
+ 
++    if (!utils.is_solana) {
++        exportDecFn(dec.acosC, "acos");
++        exportDecFn(dec.asinC, "asin");
++        exportDecFn(dec.atanC, "atan");
++        exportDecFn(dec.cosC, "cos");
++        exportDecFn(dec.logC, "log");
++        exportDecFn(dec.powC, "pow");
++        exportDecFn(dec.sinC, "sin");
++        exportDecFn(dec.tanC, "tan");
++    }
++
+     for (INTEGERS) |T| {
+         dec.exportFromInt(T, ROC_BUILTINS ++ ".dec.from_int.");
+ 
+@@ -224,12 +223,24 @@ comptime {
+ 
+     for (INTEGERS) |T| {
+         str.exportFromInt(T, ROC_BUILTINS ++ "." ++ STR ++ ".from_int.");
+-        num.exportParseInt(T, ROC_BUILTINS ++ "." ++ STR ++ ".to_int.");
++        // exportParseInt uses std.fmt.parseInt which pulls in Writer code with inline intrinsics
++        // For SBF, use simple implementation that avoids std.fmt
++        if (utils.is_solana) {
++            num.exportParseIntSbf(T, ROC_BUILTINS ++ "." ++ STR ++ ".to_int.");
++        } else {
++            num.exportParseInt(T, ROC_BUILTINS ++ "." ++ STR ++ ".to_int.");
++        }
+     }
+ 
+     for (FLOATS) |T| {
+         str.exportFromFloat(T, ROC_BUILTINS ++ "." ++ STR ++ ".from_float.");
+-        num.exportParseFloat(T, ROC_BUILTINS ++ "." ++ STR ++ ".to_float.");
++        // exportParseFloat uses std.fmt.parseFloat which pulls in Writer code with inline intrinsics
++        // For SBF, use simple implementation that avoids std.fmt
++        if (utils.is_solana) {
++            num.exportParseFloatSbf(T, ROC_BUILTINS ++ "." ++ STR ++ ".to_float.");
++        } else {
++            num.exportParseFloat(T, ROC_BUILTINS ++ "." ++ STR ++ ".to_float.");
++        }
+     }
+ }
+ 
+@@ -248,26 +259,29 @@ comptime {
+     exportUtilsFn(utils.allocateWithRefcountC, "allocate_with_refcount");
+     exportUtilsFn(utils.dictPseudoSeed, "dict_pseudo_seed");
+ 
+-    @export(panic_utils.panic, .{ .name = "roc_builtins.utils." ++ "panic", .linkage = .weak });
+-    @export(dbg_utils.dbg_impl, .{ .name = "roc_builtins.utils." ++ "dbg_impl", .linkage = .weak });
++    @export(&panic_utils.panic, .{ .name = "roc_builtins.utils." ++ "panic", .linkage = .weak });
++    @export(&dbg_utils.dbg_impl, .{ .name = "roc_builtins.utils." ++ "dbg_impl", .linkage = .weak });
+ 
+-    if (builtin.target.cpu.arch != .wasm32) {
++    // Expect functions use OS-specific features not available on wasm32 or Solana
++    const has_sbf_target = @hasField(std.Target.Cpu.Arch, "sbf");
++    const is_solana_target = has_sbf_target and builtin.cpu.arch == .sbf;
++    if (builtin.target.cpu.arch != .wasm32 and !is_solana_target) {
+         exportUtilsFn(expect.expectFailedStartSharedBuffer, "expect_failed_start_shared_buffer");
+         exportUtilsFn(expect.expectFailedStartSharedFile, "expect_failed_start_shared_file");
+         exportUtilsFn(expect.notifyParentExpect, "notify_parent_expect");
+ 
+         // sets the buffer used for expect failures
+-        @export(expect.setSharedBuffer, .{ .name = "set_shared_buffer", .linkage = .weak });
++        @export(&expect.setSharedBuffer, .{ .name = "set_shared_buffer", .linkage = .weak });
+ 
+         exportUtilsFn(expect.readSharedBufferEnv, "read_env_shared_buffer");
+     }
+ 
+     if (builtin.target.cpu.arch == .aarch64) {
+-        @export(__roc_force_setjmp, .{ .name = "__roc_force_setjmp", .linkage = .weak });
+-        @export(__roc_force_longjmp, .{ .name = "__roc_force_longjmp", .linkage = .weak });
++        @export(&__roc_force_setjmp, .{ .name = "__roc_force_setjmp", .linkage = .weak });
++        @export(&__roc_force_longjmp, .{ .name = "__roc_force_longjmp", .linkage = .weak });
+     } else if (builtin.os.tag == .windows) {
+-        @export(__roc_force_setjmp_windows, .{ .name = "__roc_force_setjmp", .linkage = .weak });
+-        @export(__roc_force_longjmp_windows, .{ .name = "__roc_force_longjmp", .linkage = .weak });
++        @export(&__roc_force_setjmp_windows, .{ .name = "__roc_force_setjmp", .linkage = .weak });
++        @export(&__roc_force_longjmp_windows, .{ .name = "__roc_force_longjmp", .linkage = .weak });
+     }
+ }
+ 
+@@ -285,22 +299,22 @@ pub extern fn siglongjmp([*c]c_int, c_int) noreturn;
+ pub extern fn longjmperror() void;
+ 
+ // Zig won't expose the externs (and hence link correctly) unless we force them to be used.
+-fn __roc_force_setjmp(it: [*c]c_int) callconv(.C) c_int {
++fn __roc_force_setjmp(it: [*c]c_int) callconv(utils.cc) c_int {
+     return setjmp(it);
+ }
+ 
+-fn __roc_force_longjmp(a0: [*c]c_int, a1: c_int) callconv(.C) noreturn {
++fn __roc_force_longjmp(a0: [*c]c_int, a1: c_int) callconv(utils.cc) noreturn {
+     longjmp(a0, a1);
+ }
+ 
+ pub extern fn windows_setjmp([*c]c_int) c_int;
+ pub extern fn windows_longjmp([*c]c_int, c_int) noreturn;
+ 
+-fn __roc_force_setjmp_windows(it: [*c]c_int) callconv(.C) c_int {
++fn __roc_force_setjmp_windows(it: [*c]c_int) callconv(utils.cc) c_int {
+     return windows_setjmp(it);
+ }
+ 
+-fn __roc_force_longjmp_windows(a0: [*c]c_int, a1: c_int) callconv(.C) noreturn {
++fn __roc_force_longjmp_windows(a0: [*c]c_int, a1: c_int) callconv(utils.cc) noreturn {
+     windows_longjmp(a0, a1);
+ }
+ 
+@@ -382,7 +396,7 @@ comptime {
+ 
+ // Export helpers - Must be run inside a comptime
+ fn exportBuiltinFn(comptime func: anytype, comptime func_name: []const u8) void {
+-    @export(func, .{ .name = "roc_builtins." ++ func_name, .linkage = .strong });
++    @export(&func, .{ .name = "roc_builtins." ++ func_name, .linkage = .strong });
+ }
+ fn exportNumFn(comptime func: anytype, comptime func_name: []const u8) void {
+     exportBuiltinFn(func, "num." ++ func_name);
+@@ -406,11 +420,15 @@ fn exportUtilsFn(comptime func: anytype, comptime func_name: []const u8) void {
+ 
+ // Custom panic function, as builtin Zig version errors during LLVM verification
+ pub fn panic(message: []const u8, stacktrace: ?*std.builtin.StackTrace, _: ?usize) noreturn {
+-    if (builtin.target.cpu.arch != .wasm32) {
+-        std.debug.print("\nSomehow in unreachable zig panic!\nThis is a roc standard libarry bug\n{s}: {?}", .{ message, stacktrace });
++    // Check if SBF target is supported (solana-zig only)
++    const has_sbf = @hasField(std.Target.Cpu.Arch, "sbf");
++    const is_solana = has_sbf and builtin.cpu.arch == .sbf;
++
++    if (builtin.target.cpu.arch != .wasm32 and !is_solana) {
++        std.debug.print("\nSomehow in unreachable zig panic!\nThis is a roc standard libarry bug\n{s}: {any}", .{ message, stacktrace });
+         std.process.abort();
+     } else {
+-        // Can't call abort or print from wasm. Just leave it as unreachable.
++        // Can't call abort or print from wasm or Solana. Just leave it as unreachable.
+         unreachable;
+     }
+ }
+diff --git a/crates/compiler/builtins/bitcode/src/num.zig b/crates/compiler/builtins/bitcode/src/num.zig
+index bd49072418..a534d4b39f 100644
+--- a/crates/compiler/builtins/bitcode/src/num.zig
++++ b/crates/compiler/builtins/bitcode/src/num.zig
+@@ -2,8 +2,9 @@ const std = @import("std");
+ const math = std.math;
+ const RocList = @import("list.zig").RocList;
+ const RocStr = @import("str.zig").RocStr;
+-const WithOverflow = @import("utils.zig").WithOverflow;
+-const Ordering = @import("utils.zig").Ordering;
++const utils = @import("utils.zig");
++const WithOverflow = utils.WithOverflow;
++const Ordering = utils.Ordering;
+ const roc_panic = @import("panic.zig").panic_help;
+ 
+ pub fn NumParseResult(comptime T: type) type {
+@@ -66,54 +67,254 @@ pub fn mul_u128(a: u128, b: u128) U256 {
+     return .{ .hi = hi, .lo = lo };
+ }
+ 
+-pub fn exportParseInt(comptime T: type, comptime name: []const u8) void {
++// Only define exportParseInt for non-SBF targets to avoid pulling in std.fmt
++// which contains Writer code with variable-size inline intrinsics
++pub const exportParseInt = if (utils.is_solana)
++    struct {
++        pub fn placeholder(comptime T: type, comptime name: []const u8) void {
++            _ = T;
++            _ = name;
++            @compileError("exportParseInt should not be called for SBF");
++        }
++    }.placeholder
++else
++    struct {
++        pub fn func(comptime T: type, comptime name: []const u8) void {
++            const f = struct {
++                fn func(buf: RocStr) callconv(utils.cc) NumParseResult(T) {
++                    // a radix of 0 will make zig determine the radix from the frefix:
++                    //  * A prefix of "0b" implies radix=2,
++                    //  * A prefix of "0o" implies radix=8,
++                    //  * A prefix of "0x" implies radix=16,
++                    //  * Otherwise radix=10 is assumed.
++                    const radix = 0;
++                    if (std.fmt.parseInt(T, buf.asSlice(), radix)) |success| {
++                        return .{ .errorcode = 0, .value = success };
++                    } else |_| {
++                        return .{ .errorcode = 1, .value = 0 };
++                    }
++                }
++            }.func;
++            @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++        }
++    }.func;
++
++// Only define exportParseFloat for non-SBF targets
++pub const exportParseFloat = if (utils.is_solana)
++    struct {
++        pub fn placeholder(comptime T: type, comptime name: []const u8) void {
++            _ = T;
++            _ = name;
++            @compileError("exportParseFloat should not be called for SBF");
++        }
++    }.placeholder
++else
++    struct {
++        pub fn func(comptime T: type, comptime name: []const u8) void {
++            const f = struct {
++                fn func(buf: RocStr) callconv(utils.cc) NumParseResult(T) {
++                    if (std.fmt.parseFloat(T, buf.asSlice())) |success| {
++                        return .{ .errorcode = 0, .value = success };
++                    } else |_| {
++                        return .{ .errorcode = 1, .value = 0 };
++                    }
++                }
++            }.func;
++            @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++        }
++    }.func;
++
++// Simple parseInt implementation for SBF that avoids std.fmt (which pulls in Writer with inline intrinsics)
++pub fn exportParseIntSbf(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(buf: RocStr) callconv(.C) NumParseResult(T) {
+-            // a radix of 0 will make zig determine the radix from the frefix:
+-            //  * A prefix of "0b" implies radix=2,
+-            //  * A prefix of "0o" implies radix=8,
+-            //  * A prefix of "0x" implies radix=16,
+-            //  * Otherwise radix=10 is assumed.
+-            const radix = 0;
+-            if (std.fmt.parseInt(T, buf.asSlice(), radix)) |success| {
+-                return .{ .errorcode = 0, .value = success };
+-            } else |_| {
++        fn func(buf: RocStr) callconv(utils.cc) NumParseResult(T) {
++            const slice = buf.asSlice();
++            if (slice.len == 0) {
+                 return .{ .errorcode = 1, .value = 0 };
+             }
++
++            var idx: usize = 0;
++            var negative = false;
++            var radix: u8 = 10;
++
++            // Handle sign
++            if (slice[idx] == '-') {
++                negative = true;
++                idx += 1;
++            } else if (slice[idx] == '+') {
++                idx += 1;
++            }
++
++            if (idx >= slice.len) {
++                return .{ .errorcode = 1, .value = 0 };
++            }
++
++            // Detect radix prefix
++            if (slice.len > idx + 1 and slice[idx] == '0') {
++                switch (slice[idx + 1]) {
++                    'b', 'B' => {
++                        radix = 2;
++                        idx += 2;
++                    },
++                    'o', 'O' => {
++                        radix = 8;
++                        idx += 2;
++                    },
++                    'x', 'X' => {
++                        radix = 16;
++                        idx += 2;
++                    },
++                    else => {},
++                }
++            }
++
++            if (idx >= slice.len) {
++                return .{ .errorcode = 1, .value = 0 };
++            }
++
++            const is_signed = @typeInfo(T).int.signedness == .signed;
++            var result: T = 0;
++
++            while (idx < slice.len) : (idx += 1) {
++                const c = slice[idx];
++                const digit: u8 = if (c >= '0' and c <= '9')
++                    c - '0'
++                else if (c >= 'a' and c <= 'f')
++                    c - 'a' + 10
++                else if (c >= 'A' and c <= 'F')
++                    c - 'A' + 10
++                else
++                    return .{ .errorcode = 1, .value = 0 };
++
++                if (digit >= radix) {
++                    return .{ .errorcode = 1, .value = 0 };
++                }
++
++                // Check for overflow - use intCast which will fail at comptime if radix > max(T)
++                // but radix is always 2, 8, 10, or 16 which fits in any integer type we support
++                const mul_result = @mulWithOverflow(result, @as(T, @intCast(radix)));
++                if (mul_result[1] == 1) {
++                    return .{ .errorcode = 1, .value = 0 };
++                }
++                const add_result = @addWithOverflow(mul_result[0], @as(T, @intCast(digit)));
++                if (add_result[1] == 1) {
++                    return .{ .errorcode = 1, .value = 0 };
++                }
++                result = add_result[0];
++            }
++
++            if (negative) {
++                if (is_signed) {
++                    const neg_result = @subWithOverflow(@as(T, 0), result);
++                    if (neg_result[1] == 1) {
++                        return .{ .errorcode = 1, .value = 0 };
++                    }
++                    return .{ .errorcode = 0, .value = neg_result[0] };
++                } else {
++                    return .{ .errorcode = 1, .value = 0 };
++                }
++            }
++
++            return .{ .errorcode = 0, .value = result };
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+-pub fn exportParseFloat(comptime T: type, comptime name: []const u8) void {
++// Simple parseFloat implementation for SBF that avoids std.fmt
++// This is a very basic implementation - for Solana programs, float parsing is rarely needed
++pub fn exportParseFloatSbf(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(buf: RocStr) callconv(.C) NumParseResult(T) {
+-            if (std.fmt.parseFloat(T, buf.asSlice())) |success| {
+-                return .{ .errorcode = 0, .value = success };
+-            } else |_| {
++        fn func(buf: RocStr) callconv(utils.cc) NumParseResult(T) {
++            const slice = buf.asSlice();
++            if (slice.len == 0) {
++                return .{ .errorcode = 1, .value = 0 };
++            }
++
++            var idx: usize = 0;
++            var negative = false;
++
++            // Handle sign
++            if (slice[idx] == '-') {
++                negative = true;
++                idx += 1;
++            } else if (slice[idx] == '+') {
++                idx += 1;
++            }
++
++            if (idx >= slice.len) {
+                 return .{ .errorcode = 1, .value = 0 };
+             }
++
++            var integer_part: i64 = 0;
++            var fraction_part: i64 = 0;
++            var fraction_digits: u32 = 0;
++            var in_fraction = false;
++
++            while (idx < slice.len) : (idx += 1) {
++                const c = slice[idx];
++                if (c == '.') {
++                    if (in_fraction) {
++                        return .{ .errorcode = 1, .value = 0 };
++                    }
++                    in_fraction = true;
++                    continue;
++                }
++                if (c == 'e' or c == 'E') {
++                    // Exponent not supported in simple implementation
++                    return .{ .errorcode = 1, .value = 0 };
++                }
++                if (c < '0' or c > '9') {
++                    return .{ .errorcode = 1, .value = 0 };
++                }
++                const digit: i64 = c - '0';
++                if (in_fraction) {
++                    if (fraction_digits < 18) { // Limit precision
++                        fraction_part = fraction_part * 10 + digit;
++                        fraction_digits += 1;
++                    }
++                } else {
++                    integer_part = integer_part * 10 + digit;
++                }
++            }
++
++            var result: T = @floatFromInt(integer_part);
++
++            if (fraction_digits > 0) {
++                var divisor: T = 1.0;
++                var i: u32 = 0;
++                while (i < fraction_digits) : (i += 1) {
++                    divisor *= 10.0;
++                }
++                result += @as(T, @floatFromInt(fraction_part)) / divisor;
++            }
++
++            if (negative) {
++                result = -result;
++            }
++
++            return .{ .errorcode = 0, .value = result };
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportNumToFloatCast(comptime T: type, comptime F: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(x: T) callconv(.C) F {
++        fn func(x: T) callconv(utils.cc) F {
+             return @floatFromInt(x);
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportPow(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(base: T, exp: T) callconv(.C) T {
++        fn func(base: T, exp: T) callconv(utils.cc) T {
+             switch (@typeInfo(T)) {
+                 // std.math.pow can handle ints via powi, but it turns any errors to unreachable
+                 // we want to catch overflow and report a proper error to the user
+-                .Int => {
++                .int => {
+                     if (std.math.powi(T, base, exp)) |value| {
+                         return value;
+                     } else |err| switch (err) {
+@@ -127,153 +328,153 @@ pub fn exportPow(comptime T: type, comptime name: []const u8) void {
+             }
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportIsNan(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(input: T) callconv(.C) bool {
++        fn func(input: T) callconv(utils.cc) bool {
+             return std.math.isNan(input);
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportIsInfinite(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(input: T) callconv(.C) bool {
++        fn func(input: T) callconv(utils.cc) bool {
+             return std.math.isInf(input);
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportIsFinite(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(input: T) callconv(.C) bool {
++        fn func(input: T) callconv(utils.cc) bool {
+             return std.math.isFinite(input);
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportAsin(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(input: T) callconv(.C) T {
++        fn func(input: T) callconv(utils.cc) T {
+             return std.math.asin(input);
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportAcos(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(input: T) callconv(.C) T {
++        fn func(input: T) callconv(utils.cc) T {
+             return std.math.acos(input);
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportAtan(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(input: T) callconv(.C) T {
++        fn func(input: T) callconv(utils.cc) T {
+             return std.math.atan(input);
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportSin(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(input: T) callconv(.C) T {
++        fn func(input: T) callconv(utils.cc) T {
+             return math.sin(input);
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportCos(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(input: T) callconv(.C) T {
++        fn func(input: T) callconv(utils.cc) T {
+             return math.cos(input);
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportTan(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(input: T) callconv(.C) T {
++        fn func(input: T) callconv(utils.cc) T {
+             return math.tan(input);
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportLog(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(input: T) callconv(.C) T {
++        fn func(input: T) callconv(utils.cc) T {
+             return @log(input);
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportFAbs(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(input: T) callconv(.C) T {
++        fn func(input: T) callconv(utils.cc) T {
+             return @abs(input);
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportSqrt(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(input: T) callconv(.C) T {
++        fn func(input: T) callconv(utils.cc) T {
+             return math.sqrt(input);
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportRound(comptime F: type, comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(input: F) callconv(.C) T {
++        fn func(input: F) callconv(utils.cc) T {
+             return @as(T, @intFromFloat((math.round(input))));
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportFloor(comptime F: type, comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(input: F) callconv(.C) T {
++        fn func(input: F) callconv(utils.cc) T {
+             return @as(T, @intFromFloat((math.floor(input))));
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportCeiling(comptime F: type, comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(input: F) callconv(.C) T {
++        fn func(input: F) callconv(utils.cc) T {
+             return @as(T, @intFromFloat((math.ceil(input))));
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportDivCeil(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(a: T, b: T) callconv(.C) T {
++        fn func(a: T, b: T) callconv(utils.cc) T {
+             return math.divCeil(T, a, b) catch {
+                 roc_panic("Integer division by 0!", 0);
+             };
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn ToIntCheckedResult(comptime T: type) type {
+@@ -287,26 +488,26 @@ pub fn ToIntCheckedResult(comptime T: type) type {
+ 
+ pub fn exportToIntCheckingMax(comptime From: type, comptime To: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(input: From) callconv(.C) ToIntCheckedResult(To) {
++        fn func(input: From) callconv(utils.cc) ToIntCheckedResult(To) {
+             if (input > std.math.maxInt(To)) {
+                 return .{ .out_of_bounds = true, .value = 0 };
+             }
+             return .{ .out_of_bounds = false, .value = @as(To, @intCast(input)) };
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(From), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(From), .linkage = .strong });
+ }
+ 
+ pub fn exportToIntCheckingMaxAndMin(comptime From: type, comptime To: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(input: From) callconv(.C) ToIntCheckedResult(To) {
++        fn func(input: From) callconv(utils.cc) ToIntCheckedResult(To) {
+             if (input > std.math.maxInt(To) or input < std.math.minInt(To)) {
+                 return .{ .out_of_bounds = true, .value = 0 };
+             }
+             return .{ .out_of_bounds = false, .value = @as(To, @intCast(input)) };
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(From), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(From), .linkage = .strong });
+ }
+ 
+ fn isMultipleOf(comptime T: type, lhs: T, rhs: T) bool {
+@@ -326,16 +527,16 @@ fn isMultipleOf(comptime T: type, lhs: T, rhs: T) bool {
+ 
+ pub fn exportIsMultipleOf(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(self: T, other: T) callconv(.C) bool {
++        fn func(self: T, other: T) callconv(utils.cc) bool {
+             return @call(.always_inline, isMultipleOf, .{ T, self, other });
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ fn addWithOverflow(comptime T: type, self: T, other: T) WithOverflow(T) {
+     switch (@typeInfo(T)) {
+-        .Int => {
++        .int => {
+             const answer = @addWithOverflow(self, other);
+             return .{ .value = answer[0], .has_overflowed = answer[1] == 1 };
+         },
+@@ -349,20 +550,20 @@ fn addWithOverflow(comptime T: type, self: T, other: T) WithOverflow(T) {
+ 
+ pub fn exportAddWithOverflow(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(self: T, other: T) callconv(.C) WithOverflow(T) {
++        fn func(self: T, other: T) callconv(utils.cc) WithOverflow(T) {
+             return @call(.always_inline, addWithOverflow, .{ T, self, other });
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportAddSaturatedInt(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(self: T, other: T) callconv(.C) T {
++        fn func(self: T, other: T) callconv(utils.cc) T {
+             const result = addWithOverflow(T, self, other);
+             if (result.has_overflowed) {
+                 // We can unambiguously tell which way it wrapped, because we have N+1 bits including the overflow bit
+-                if (result.value >= 0 and @typeInfo(T).Int.signedness == .signed) {
++                if (result.value >= 0 and @typeInfo(T).int.signedness == .signed) {
+                     return std.math.minInt(T);
+                 } else {
+                     return std.math.maxInt(T);
+@@ -372,21 +573,21 @@ pub fn exportAddSaturatedInt(comptime T: type, comptime name: []const u8) void {
+             }
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportAddWrappedInt(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(self: T, other: T) callconv(.C) T {
++        fn func(self: T, other: T) callconv(utils.cc) T {
+             return self +% other;
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportAddOrPanic(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(self: T, other: T) callconv(.C) T {
++        fn func(self: T, other: T) callconv(utils.cc) T {
+             const result = addWithOverflow(T, self, other);
+             if (result.has_overflowed) {
+                 roc_panic("Integer addition overflowed!", 0);
+@@ -395,12 +596,12 @@ pub fn exportAddOrPanic(comptime T: type, comptime name: []const u8) void {
+             }
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ fn subWithOverflow(comptime T: type, self: T, other: T) WithOverflow(T) {
+     switch (@typeInfo(T)) {
+-        .Int => {
++        .int => {
+             const answer = @subWithOverflow(self, other);
+             return .{ .value = answer[0], .has_overflowed = answer[1] == 1 };
+         },
+@@ -414,19 +615,19 @@ fn subWithOverflow(comptime T: type, self: T, other: T) WithOverflow(T) {
+ 
+ pub fn exportSubWithOverflow(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(self: T, other: T) callconv(.C) WithOverflow(T) {
++        fn func(self: T, other: T) callconv(utils.cc) WithOverflow(T) {
+             return @call(.always_inline, subWithOverflow, .{ T, self, other });
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportSubSaturatedInt(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(self: T, other: T) callconv(.C) T {
++        fn func(self: T, other: T) callconv(utils.cc) T {
+             const result = subWithOverflow(T, self, other);
+             if (result.has_overflowed) {
+-                if (@typeInfo(T).Int.signedness == .unsigned) {
++                if (@typeInfo(T).int.signedness == .unsigned) {
+                     return 0;
+                 } else if (self < 0) {
+                     return std.math.minInt(T);
+@@ -438,21 +639,21 @@ pub fn exportSubSaturatedInt(comptime T: type, comptime name: []const u8) void {
+             }
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportSubWrappedInt(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(self: T, other: T) callconv(.C) T {
++        fn func(self: T, other: T) callconv(utils.cc) T {
+             return self -% other;
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportSubOrPanic(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(self: T, other: T) callconv(.C) T {
++        fn func(self: T, other: T) callconv(utils.cc) T {
+             const result = subWithOverflow(T, self, other);
+             if (result.has_overflowed) {
+                 roc_panic("Integer subtraction overflowed!", 0);
+@@ -461,12 +662,12 @@ pub fn exportSubOrPanic(comptime T: type, comptime name: []const u8) void {
+             }
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ fn mulWithOverflow(comptime T: type, comptime W: type, self: T, other: T) WithOverflow(T) {
+     switch (@typeInfo(T)) {
+-        .Int => {
++        .int => {
+             if (T == i128) {
+                 const is_answer_negative = (self < 0) != (other < 0);
+                 const max = std.math.maxInt(i128);
+@@ -542,33 +743,33 @@ fn mulWithOverflow(comptime T: type, comptime W: type, self: T, other: T) WithOv
+ 
+ pub fn exportMulWithOverflow(comptime T: type, comptime W: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(self: T, other: T) callconv(.C) WithOverflow(T) {
++        fn func(self: T, other: T) callconv(utils.cc) WithOverflow(T) {
+             return @call(.always_inline, mulWithOverflow, .{ T, W, self, other });
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportMulSaturatedInt(comptime T: type, comptime W: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(self: T, other: T) callconv(.C) T {
++        fn func(self: T, other: T) callconv(utils.cc) T {
+             const result = @call(.always_inline, mulWithOverflow, .{ T, W, self, other });
+             return result.value;
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportMulWrappedInt(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(self: T, other: T) callconv(.C) T {
++        fn func(self: T, other: T) callconv(utils.cc) T {
+             return self *% other;
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+-pub fn shiftRightZeroFillI128(self: i128, other: u8) callconv(.C) i128 {
++pub fn shiftRightZeroFillI128(self: i128, other: u8) callconv(utils.cc) i128 {
+     if (other & 0b1000_0000 > 0) {
+         return 0;
+     } else {
+@@ -576,7 +777,7 @@ pub fn shiftRightZeroFillI128(self: i128, other: u8) callconv(.C) i128 {
+     }
+ }
+ 
+-pub fn shiftRightZeroFillU128(self: u128, other: u8) callconv(.C) u128 {
++pub fn shiftRightZeroFillU128(self: u128, other: u8) callconv(utils.cc) u128 {
+     if (other & 0b1000_0000 > 0) {
+         return 0;
+     } else {
+@@ -584,7 +785,7 @@ pub fn shiftRightZeroFillU128(self: u128, other: u8) callconv(.C) u128 {
+     }
+ }
+ 
+-pub fn compareI128(self: i128, other: i128) callconv(.C) Ordering {
++pub fn compareI128(self: i128, other: i128) callconv(utils.cc) Ordering {
+     if (self == other) {
+         return Ordering.EQ;
+     } else if (self < other) {
+@@ -594,7 +795,7 @@ pub fn compareI128(self: i128, other: i128) callconv(.C) Ordering {
+     }
+ }
+ 
+-pub fn compareU128(self: u128, other: u128) callconv(.C) Ordering {
++pub fn compareU128(self: u128, other: u128) callconv(utils.cc) Ordering {
+     if (self == other) {
+         return Ordering.EQ;
+     } else if (self < other) {
+@@ -604,41 +805,41 @@ pub fn compareU128(self: u128, other: u128) callconv(.C) Ordering {
+     }
+ }
+ 
+-pub fn lessThanI128(self: i128, other: i128) callconv(.C) bool {
++pub fn lessThanI128(self: i128, other: i128) callconv(utils.cc) bool {
+     return self < other;
+ }
+ 
+-pub fn lessThanOrEqualI128(self: i128, other: i128) callconv(.C) bool {
++pub fn lessThanOrEqualI128(self: i128, other: i128) callconv(utils.cc) bool {
+     return self <= other;
+ }
+ 
+-pub fn greaterThanI128(self: i128, other: i128) callconv(.C) bool {
++pub fn greaterThanI128(self: i128, other: i128) callconv(utils.cc) bool {
+     return self > other;
+ }
+ 
+-pub fn greaterThanOrEqualI128(self: i128, other: i128) callconv(.C) bool {
++pub fn greaterThanOrEqualI128(self: i128, other: i128) callconv(utils.cc) bool {
+     return self >= other;
+ }
+ 
+-pub fn lessThanU128(self: u128, other: u128) callconv(.C) bool {
++pub fn lessThanU128(self: u128, other: u128) callconv(utils.cc) bool {
+     return self < other;
+ }
+ 
+-pub fn lessThanOrEqualU128(self: u128, other: u128) callconv(.C) bool {
++pub fn lessThanOrEqualU128(self: u128, other: u128) callconv(utils.cc) bool {
+     return self <= other;
+ }
+ 
+-pub fn greaterThanU128(self: u128, other: u128) callconv(.C) bool {
++pub fn greaterThanU128(self: u128, other: u128) callconv(utils.cc) bool {
+     return self > other;
+ }
+ 
+-pub fn greaterThanOrEqualU128(self: u128, other: u128) callconv(.C) bool {
++pub fn greaterThanOrEqualU128(self: u128, other: u128) callconv(utils.cc) bool {
+     return self >= other;
+ }
+ 
+ pub fn exportMulOrPanic(comptime T: type, comptime W: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(self: T, other: T) callconv(.C) T {
++        fn func(self: T, other: T) callconv(utils.cc) T {
+             const result = @call(.always_inline, mulWithOverflow, .{ T, W, self, other });
+             if (result.has_overflowed) {
+                 roc_panic("Integer multiplication overflowed!", 0);
+@@ -647,37 +848,37 @@ pub fn exportMulOrPanic(comptime T: type, comptime W: type, comptime name: []con
+             }
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportCountLeadingZeroBits(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(self: T) callconv(.C) u8 {
++        fn func(self: T) callconv(utils.cc) u8 {
+             return @as(u8, @clz(self));
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportCountTrailingZeroBits(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(self: T) callconv(.C) u8 {
++        fn func(self: T) callconv(utils.cc) u8 {
+             return @as(u8, @ctz(self));
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ pub fn exportCountOneBits(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(self: T) callconv(.C) u8 {
++        fn func(self: T) callconv(utils.cc) u8 {
+             return @as(u8, @popCount(self));
+         }
+     }.func;
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+-pub fn f32ToParts(self: f32) callconv(.C) F32Parts {
++pub fn f32ToParts(self: f32) callconv(utils.cc) F32Parts {
+     const u32Value = @as(u32, @bitCast(self));
+     return F32Parts{
+         .fraction = u32Value & 0x7fffff,
+@@ -686,7 +887,7 @@ pub fn f32ToParts(self: f32) callconv(.C) F32Parts {
+     };
+ }
+ 
+-pub fn f64ToParts(self: f64) callconv(.C) F64Parts {
++pub fn f64ToParts(self: f64) callconv(utils.cc) F64Parts {
+     const u64Value = @as(u64, @bitCast(self));
+     return F64Parts{
+         .fraction = u64Value & 0xfffffffffffff,
+@@ -695,34 +896,34 @@ pub fn f64ToParts(self: f64) callconv(.C) F64Parts {
+     };
+ }
+ 
+-pub fn f32FromParts(parts: F32Parts) callconv(.C) f32 {
++pub fn f32FromParts(parts: F32Parts) callconv(utils.cc) f32 {
+     return @as(f32, @bitCast(parts.fraction & 0x7fffff | (@as(u32, parts.exponent) << 23) | (@as(u32, @intFromBool(parts.sign)) << 31)));
+ }
+ 
+-pub fn f64FromParts(parts: F64Parts) callconv(.C) f64 {
++pub fn f64FromParts(parts: F64Parts) callconv(utils.cc) f64 {
+     return @as(f64, @bitCast(parts.fraction & 0xfffffffffffff | (@as(u64, parts.exponent & 0x7ff) << 52) | (@as(u64, @intFromBool(parts.sign)) << 63)));
+ }
+ 
+-pub fn f32ToBits(self: f32) callconv(.C) u32 {
++pub fn f32ToBits(self: f32) callconv(utils.cc) u32 {
+     return @as(u32, @bitCast(self));
+ }
+ 
+-pub fn f64ToBits(self: f64) callconv(.C) u64 {
++pub fn f64ToBits(self: f64) callconv(utils.cc) u64 {
+     return @as(u64, @bitCast(self));
+ }
+ 
+-pub fn i128ToBits(self: i128) callconv(.C) u128 {
++pub fn i128ToBits(self: i128) callconv(utils.cc) u128 {
+     return @as(u128, @bitCast(self));
+ }
+ 
+-pub fn f32FromBits(bits: u32) callconv(.C) f32 {
++pub fn f32FromBits(bits: u32) callconv(utils.cc) f32 {
+     return @as(f32, @bitCast(bits));
+ }
+ 
+-pub fn f64FromBits(bits: u64) callconv(.C) f64 {
++pub fn f64FromBits(bits: u64) callconv(utils.cc) f64 {
+     return @as(f64, @bitCast(bits));
+ }
+ 
+-pub fn i128FromBits(bits: u128) callconv(.C) i128 {
++pub fn i128FromBits(bits: u128) callconv(utils.cc) i128 {
+     return @as(i128, @bitCast(bits));
+ }
+diff --git a/crates/compiler/builtins/bitcode/src/panic.zig b/crates/compiler/builtins/bitcode/src/panic.zig
+index 13224a67df..0b33432286 100644
+--- a/crates/compiler/builtins/bitcode/src/panic.zig
++++ b/crates/compiler/builtins/bitcode/src/panic.zig
+@@ -1,8 +1,9 @@
+ const std = @import("std");
++const utils = @import("utils.zig");
+ const RocStr = @import("str.zig").RocStr;
+ 
+ // Signals to the host that the program has panicked
+-extern fn roc_panic(msg: *const RocStr, tag_id: u32) callconv(.C) noreturn;
++extern fn roc_panic(msg: *const RocStr, tag_id: u32) callconv(utils.cc) noreturn;
+ 
+ pub fn panic_help(msg: []const u8, tag_id: u32) noreturn {
+     var str = RocStr.init(msg.ptr, msg.len);
+@@ -10,6 +11,6 @@ pub fn panic_help(msg: []const u8, tag_id: u32) noreturn {
+ }
+ 
+ // must export this explicitly because right now it is not used from zig code
+-pub fn panic(msg: *const RocStr, alignment: u32) callconv(.C) noreturn {
++pub fn panic(msg: *const RocStr, alignment: u32) callconv(utils.cc) noreturn {
+     return roc_panic(msg, alignment);
+ }
+diff --git a/crates/compiler/builtins/bitcode/src/sort.zig b/crates/compiler/builtins/bitcode/src/sort.zig
+index 722a5bee90..8593d7e8de 100644
+--- a/crates/compiler/builtins/bitcode/src/sort.zig
++++ b/crates/compiler/builtins/bitcode/src/sort.zig
+@@ -4,14 +4,21 @@ const testing = std.testing;
+ const utils = @import("utils.zig");
+ const roc_panic = @import("panic.zig").panic_help;
+ 
++// Simple assertion that doesn't use std.debug features (safe for Solana)
++inline fn sortAssert(ok: bool) void {
++    if (!ok) {
++        roc_panic("sort assertion failure", 0);
++    }
++}
++
+ const Ordering = utils.Ordering;
+ const GT = Ordering.GT;
+ const LT = Ordering.LT;
+ const EQ = Ordering.EQ;
+ const Opaque = ?[*]u8;
+-const CompareFn = *const fn (Opaque, Opaque, Opaque) callconv(.C) u8;
+-const CopyFn = *const fn (Opaque, Opaque) callconv(.C) void;
+-const IncN = *const fn (?[*]u8, usize) callconv(.C) void;
++const CompareFn = *const fn (Opaque, Opaque, Opaque) callconv(utils.cc) u8;
++const CopyFn = *const fn (Opaque, Opaque) callconv(utils.cc) void;
++const IncN = *const fn (?[*]u8, usize) callconv(utils.cc) void;
+ 
+ /// Any size larger than the max element buffer will be sorted indirectly via pointers.
+ /// TODO: tune this. I think due to llvm inlining the compare, the value likely should be lower.
+@@ -26,7 +33,10 @@ const MAX_ELEMENT_BUFFER_SIZE: usize = 96;
+ const BufferType = [MAX_ELEMENT_BUFFER_SIZE]u8;
+ const BufferAlign = @alignOf(u128);
+ comptime {
+-    std.debug.assert(MAX_ELEMENT_BUFFER_SIZE % BufferAlign == 0);
++    // std.debug.assert is safe in comptime blocks - it doesn't use OS features
++    if (MAX_ELEMENT_BUFFER_SIZE % BufferAlign != 0) {
++        @compileError("MAX_ELEMENT_BUFFER_SIZE must be a multiple of BufferAlign");
++    }
+ }
+ 
+ // ================ Fluxsort ==================================================
+@@ -1702,7 +1712,7 @@ fn partial_backwards_merge(
+     inc_n_data: IncN,
+     comptime indirect: bool,
+ ) void {
+-    std.debug.assert(swap_len >= block_len);
++    sortAssert(swap_len >= block_len);
+ 
+     if (len == block_len) {
+         // Just a single block, already done.
+@@ -1941,7 +1951,7 @@ fn partial_forward_merge(
+     inc_n_data: IncN,
+     comptime indirect: bool,
+ ) void {
+-    std.debug.assert(swap_len >= block_len);
++    sortAssert(swap_len >= block_len);
+ 
+     if (len == block_len) {
+         // Just a single block, already done.
+@@ -3096,7 +3106,7 @@ fn parity_merge(
+     inc_n_data: IncN,
+     comptime indirect: bool,
+ ) void {
+-    std.debug.assert(left_len == right_len or left_len == right_len - 1 or left_len - 1 == right_len);
++    sortAssert(left_len == right_len or left_len == right_len - 1 or left_len - 1 == right_len);
+ 
+     var left_head = src;
+     var right_head = src + left_len * element_width;
+@@ -3220,7 +3230,7 @@ fn tiny_sort(
+     inc_n_data: IncN,
+     comptime indirect: bool,
+ ) void {
+-    std.debug.assert(len < 8);
++    sortAssert(len < 8);
+ 
+     var buffer: BufferType align(BufferAlign) = undefined;
+     const tmp_ptr = @as([*]u8, @ptrCast(&buffer[0]));
+@@ -3889,13 +3899,13 @@ test "swap" {
+     try testing.expectEqual(arr, [2]i64{ -22, -22 });
+ }
+ 
+-pub fn pointer_copy(dst_ptr: Opaque, src_ptr: Opaque) callconv(.C) void {
+-    @as(*usize, @alignCast(@ptrCast(dst_ptr))).* = @as(*usize, @alignCast(@ptrCast(src_ptr))).*;
++pub fn pointer_copy(dst_ptr: Opaque, src_ptr: Opaque) callconv(utils.cc) void {
++    @as(*usize, @ptrCast(@alignCast(dst_ptr))).* = @as(*usize, @ptrCast(@alignCast(src_ptr))).*;
+ }
+ 
+-fn test_i64_compare(_: Opaque, a_ptr: Opaque, b_ptr: Opaque) callconv(.C) u8 {
+-    const a = @as(*i64, @alignCast(@ptrCast(a_ptr))).*;
+-    const b = @as(*i64, @alignCast(@ptrCast(b_ptr))).*;
++fn test_i64_compare(_: Opaque, a_ptr: Opaque, b_ptr: Opaque) callconv(utils.cc) u8 {
++    const a = @as(*i64, @ptrCast(@alignCast(a_ptr))).*;
++    const b = @as(*i64, @ptrCast(@alignCast(b_ptr))).*;
+ 
+     const gt = @as(u8, @intFromBool(a > b));
+     const lt = @as(u8, @intFromBool(a < b));
+@@ -3906,9 +3916,9 @@ fn test_i64_compare(_: Opaque, a_ptr: Opaque, b_ptr: Opaque) callconv(.C) u8 {
+     return lt + lt + gt;
+ }
+ 
+-fn test_i64_compare_refcounted(count_ptr: Opaque, a_ptr: Opaque, b_ptr: Opaque) callconv(.C) u8 {
+-    const a = @as(*i64, @alignCast(@ptrCast(a_ptr))).*;
+-    const b = @as(*i64, @alignCast(@ptrCast(b_ptr))).*;
++fn test_i64_compare_refcounted(count_ptr: Opaque, a_ptr: Opaque, b_ptr: Opaque) callconv(utils.cc) u8 {
++    const a = @as(*i64, @ptrCast(@alignCast(a_ptr))).*;
++    const b = @as(*i64, @ptrCast(@alignCast(b_ptr))).*;
+ 
+     const gt = @as(u8, @intFromBool(a > b));
+     const lt = @as(u8, @intFromBool(a < b));
+@@ -3920,10 +3930,10 @@ fn test_i64_compare_refcounted(count_ptr: Opaque, a_ptr: Opaque, b_ptr: Opaque)
+     return lt + lt + gt;
+ }
+ 
+-fn test_i64_copy(dst_ptr: Opaque, src_ptr: Opaque) callconv(.C) void {
+-    @as(*i64, @alignCast(@ptrCast(dst_ptr))).* = @as(*i64, @alignCast(@ptrCast(src_ptr))).*;
++fn test_i64_copy(dst_ptr: Opaque, src_ptr: Opaque) callconv(utils.cc) void {
++    @as(*i64, @ptrCast(@alignCast(dst_ptr))).* = @as(*i64, @ptrCast(@alignCast(src_ptr))).*;
+ }
+ 
+-fn test_inc_n_data(count_ptr: Opaque, n: usize) callconv(.C) void {
++fn test_inc_n_data(count_ptr: Opaque, n: usize) callconv(utils.cc) void {
+     @as(*isize, @ptrCast(@alignCast(count_ptr))).* += @intCast(n);
+ }
+diff --git a/crates/compiler/builtins/bitcode/src/str.zig b/crates/compiler/builtins/bitcode/src/str.zig
+index 579b6d0efb..8cb22f19ca 100644
+--- a/crates/compiler/builtins/bitcode/src/str.zig
++++ b/crates/compiler/builtins/bitcode/src/str.zig
+@@ -56,7 +56,7 @@ pub const RocStr = extern struct {
+     // small string, and returns a (pointer, len) tuple which points to them.
+     pub fn init(bytes_ptr: [*]const u8, length: usize) RocStr {
+         var result = RocStr.allocate(length);
+-        @memcpy(result.asU8ptrMut()[0..length], bytes_ptr[0..length]);
++        utils.memcpy(result.asU8ptrMut()[0..length], bytes_ptr[0..length]);
+ 
+         return result;
+     }
+@@ -218,7 +218,7 @@ pub const RocStr = extern struct {
+             var old_bytes: [*]u8 = @as([*]u8, @ptrCast(str.bytes));
+             var new_bytes: [*]u8 = @as([*]u8, @ptrCast(new_str.bytes));
+ 
+-            @memcpy(new_bytes[0..str.length], old_bytes[0..str.length]);
++            utils.memcpy(new_bytes[0..str.length], old_bytes[0..str.length]);
+ 
+             return new_str;
+         }
+@@ -275,8 +275,8 @@ pub const RocStr = extern struct {
+             const source_ptr = self.asU8ptr();
+             const dest_ptr = result.asU8ptrMut();
+ 
+-            @memcpy(dest_ptr[0..old_length], source_ptr[0..old_length]);
+-            @memset(dest_ptr[old_length..new_length], 0);
++            utils.memcpy(dest_ptr[0..old_length], source_ptr[0..old_length]);
++            utils.memset(dest_ptr[old_length..new_length], 0);
+ 
+             self.decref();
+ 
+@@ -291,8 +291,8 @@ pub const RocStr = extern struct {
+ 
+             const source_ptr = self.asU8ptr();
+ 
+-            @memcpy(dest_ptr[0..old_length], source_ptr[0..old_length]);
+-            @memset(dest_ptr[old_length..new_length], 0);
++            utils.memcpy(dest_ptr[0..old_length], source_ptr[0..old_length]);
++            utils.memset(dest_ptr[old_length..new_length], 0);
+ 
+             self.decref();
+ 
+@@ -421,7 +421,7 @@ pub const RocStr = extern struct {
+     // a C function - like the file path argument to `fopen`.
+     pub fn memcpy(self: RocStr, dest: [*]u8) void {
+         const src = self.asU8ptr();
+-        @memcpy(dest[0..self.len()], src[0..self.len()]);
++        utils.memcpy(dest[0..self.len()], src[0..self.len()]);
+     }
+ 
+     test "RocStr.eq: small, equal" {
+@@ -541,68 +541,110 @@ pub const RocStr = extern struct {
+     }
+ };
+ 
+-pub fn init(bytes_ptr: [*]const u8, length: usize) callconv(.C) RocStr {
++pub fn init(bytes_ptr: [*]const u8, length: usize) callconv(utils.cc) RocStr {
+     return @call(.always_inline, RocStr.init, .{ bytes_ptr, length });
+ }
+ 
+ // Str.equal
+-pub fn strEqual(self: RocStr, other: RocStr) callconv(.C) bool {
++pub fn strEqual(self: RocStr, other: RocStr) callconv(utils.cc) bool {
+     return self.eq(other);
+ }
+ 
+ // Str.numberOfBytes
+-pub fn strNumberOfBytes(string: RocStr) callconv(.C) usize {
++pub fn strNumberOfBytes(string: RocStr) callconv(utils.cc) usize {
+     return string.len();
+ }
+ 
+ // Str.fromInt
+ pub fn exportFromInt(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(int: T) callconv(.C) RocStr {
++        fn func(int: T) callconv(utils.cc) RocStr {
+             return @call(.always_inline, strFromIntHelp, .{ T, int });
+         }
+     }.func;
+ 
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ fn strFromIntHelp(comptime T: type, int: T) RocStr {
+-    // determine maximum size for this T
+-    const size = comptime blk: {
+-        // the string representation of the minimum i128 value uses at most 40 characters
+-        var buf: [40]u8 = undefined;
+-        const resultMin = std.fmt.bufPrint(&buf, "{}", .{std.math.minInt(T)}) catch unreachable;
+-        const resultMax = std.fmt.bufPrint(&buf, "{}", .{std.math.maxInt(T)}) catch unreachable;
+-        const result = if (resultMin.len > resultMax.len) resultMin.len else resultMax.len;
+-        break :blk result;
++    const size = 40;
++    var buf: [size]u8 = undefined;
++    const len = if (comptime utils.is_solana) blk: {
++        break :blk formatIntSimple(T, &buf, int);
++    } else blk: {
++        const result = std.fmt.bufPrint(&buf, "{}", .{int}) catch unreachable;
++        break :blk result.len;
+     };
++    return RocStr.init(&buf, len);
++}
+ 
+-    var buf: [size]u8 = undefined;
+-    const result = std.fmt.bufPrint(&buf, "{}", .{int}) catch unreachable;
++fn formatIntSimple(comptime T: type, buf: []u8, value: T) usize {
++    var v = value;
++    var negative = false;
++
++    if (@typeInfo(T).int.signedness == .signed) {
++        if (v < 0) {
++            negative = true;
++            v = if (v == std.math.minInt(T)) blk: {
++                const U = @Type(.{ .int = .{ .signedness = .unsigned, .bits = @typeInfo(T).int.bits } });
++                break :blk @intCast(@as(U, @bitCast(v)));
++            } else -v;
++        }
++    }
++
++    var temp: [40]u8 = undefined;
++    var len: usize = 0;
+ 
+-    return RocStr.init(&buf, result.len);
++    if (v == 0) {
++        temp[len] = '0';
++        len += 1;
++    } else {
++        while (v > 0) {
++            temp[len] = @intCast('0' + @as(u8, @intCast(@mod(v, 10))));
++            v = @divTrunc(v, 10);
++            len += 1;
++        }
++    }
++
++    var pos: usize = 0;
++    if (negative) {
++        buf[pos] = '-';
++        pos += 1;
++    }
++
++    var i: usize = 0;
++    while (i < len) : (i += 1) {
++        buf[pos + i] = temp[len - 1 - i];
++    }
++
++    return pos + len;
+ }
+ 
+ // Str.fromFloat
+ pub fn exportFromFloat(comptime T: type, comptime name: []const u8) void {
+     const f = struct {
+-        fn func(float: T) callconv(.C) RocStr {
++        fn func(float: T) callconv(utils.cc) RocStr {
+             return @call(.always_inline, strFromFloatHelp, .{ T, float });
+         }
+     }.func;
+ 
+-    @export(f, .{ .name = name ++ @typeName(T), .linkage = .strong });
++    @export(&f, .{ .name = name ++ @typeName(T), .linkage = .strong });
+ }
+ 
+ fn strFromFloatHelp(comptime T: type, float: T) RocStr {
+     var buf: [400]u8 = undefined;
+-    const result = std.fmt.bufPrint(&buf, "{d}", .{float}) catch unreachable;
+-
+-    return RocStr.init(&buf, result.len);
++    if (comptime utils.is_solana) {
++        const int_part: i64 = @intFromFloat(float);
++        const len = formatIntSimple(i64, &buf, int_part);
++        return RocStr.init(&buf, len);
++    } else {
++        const result = std.fmt.bufPrint(&buf, "{d}", .{float}) catch unreachable;
++        return RocStr.init(&buf, result.len);
++    }
+ }
+ 
+ // Str.splitOn
+-pub fn strSplitOn(string: RocStr, delimiter: RocStr) callconv(.C) RocList {
++pub fn strSplitOn(string: RocStr, delimiter: RocStr) callconv(utils.cc) RocList {
+     const segment_count = countSegments(string, delimiter);
+     const list = RocList.allocate(@alignOf(RocStr), segment_count, @sizeOf(RocStr), true);
+ 
+@@ -625,7 +667,7 @@ fn strSplitOnHelp(array: [*]RocStr, string: RocStr, delimiter: RocStr) void {
+         return;
+     }
+ 
+-    var it = std.mem.split(u8, string.asSlice(), delimiter.asSlice());
++    var it = std.mem.splitSequence(u8, string.asSlice(), delimiter.asSlice());
+ 
+     var i: usize = 0;
+     var offset: usize = 0;
+@@ -964,12 +1006,12 @@ test "strSplitHelp: overlapping delimiter 2" {
+ // It is used to count how many segments the input `_str`
+ // needs to be broken into, so that we can allocate a array
+ // of that size. It always returns at least 1.
+-pub fn countSegments(string: RocStr, delimiter: RocStr) callconv(.C) usize {
++pub fn countSegments(string: RocStr, delimiter: RocStr) callconv(utils.cc) usize {
+     if (delimiter.isEmpty()) {
+         return 1;
+     }
+ 
+-    var it = std.mem.split(u8, string.asSlice(), delimiter.asSlice());
++    var it = std.mem.splitSequence(u8, string.asSlice(), delimiter.asSlice());
+     var count: usize = 0;
+ 
+     while (it.next()) |_| : (count += 1) {}
+@@ -1062,19 +1104,19 @@ test "countSegments: overlapping delimiter 2" {
+     try expectEqual(segments_count, 3);
+ }
+ 
+-pub fn countUtf8Bytes(string: RocStr) callconv(.C) u64 {
++pub fn countUtf8Bytes(string: RocStr) callconv(utils.cc) u64 {
+     return @intCast(string.len());
+ }
+ 
+-pub fn isEmpty(string: RocStr) callconv(.C) bool {
++pub fn isEmpty(string: RocStr) callconv(utils.cc) bool {
+     return string.isEmpty();
+ }
+ 
+-pub fn getCapacity(string: RocStr) callconv(.C) usize {
++pub fn getCapacity(string: RocStr) callconv(utils.cc) usize {
+     return string.getCapacity();
+ }
+ 
+-pub fn substringUnsafeC(string: RocStr, start_u64: u64, length_u64: u64) callconv(.C) RocStr {
++pub fn substringUnsafeC(string: RocStr, start_u64: u64, length_u64: u64) callconv(utils.cc) RocStr {
+     const start: usize = @intCast(start_u64);
+     const length: usize = @intCast(length_u64);
+ 
+@@ -1113,7 +1155,7 @@ fn substringUnsafe(string: RocStr, start: usize, length: usize) RocStr {
+     return RocStr.empty();
+ }
+ 
+-pub fn getUnsafeC(string: RocStr, index: u64) callconv(.C) u8 {
++pub fn getUnsafeC(string: RocStr, index: u64) callconv(utils.cc) u8 {
+     return string.getUnchecked(@intCast(index));
+ }
+ 
+@@ -1154,7 +1196,7 @@ test "substringUnsafe: end" {
+ }
+ 
+ // Str.startsWith
+-pub fn startsWith(string: RocStr, prefix: RocStr) callconv(.C) bool {
++pub fn startsWith(string: RocStr, prefix: RocStr) callconv(utils.cc) bool {
+     const bytes_len = string.len();
+     const bytes_ptr = string.asU8ptr();
+ 
+@@ -1177,7 +1219,7 @@ pub fn startsWith(string: RocStr, prefix: RocStr) callconv(.C) bool {
+ }
+ 
+ // Str.repeat
+-pub fn repeatC(string: RocStr, count_u64: u64) callconv(.C) RocStr {
++pub fn repeatC(string: RocStr, count_u64: u64) callconv(utils.cc) RocStr {
+     const count: usize = @intCast(count_u64);
+     const bytes_len = string.len();
+     const bytes_ptr = string.asU8ptr();
+@@ -1187,7 +1229,7 @@ pub fn repeatC(string: RocStr, count_u64: u64) callconv(.C) RocStr {
+ 
+     var i: usize = 0;
+     while (i < count) : (i += 1) {
+-        @memcpy(ret_string_ptr[0..bytes_len], bytes_ptr[0..bytes_len]);
++        utils.memcpy(ret_string_ptr[0..bytes_len], bytes_ptr[0..bytes_len]);
+         ret_string_ptr += bytes_len;
+     }
+ 
+@@ -1216,7 +1258,7 @@ test "startsWith: 12345678912345678910 starts with 123456789123456789" {
+ }
+ 
+ // Str.endsWith
+-pub fn endsWith(string: RocStr, suffix: RocStr) callconv(.C) bool {
++pub fn endsWith(string: RocStr, suffix: RocStr) callconv(utils.cc) bool {
+     const bytes_len = string.len();
+     const bytes_ptr = string.asU8ptr();
+ 
+@@ -1272,7 +1314,7 @@ test "endsWith: hello world ends with world" {
+ }
+ 
+ // Str.concat
+-pub fn strConcatC(arg1: RocStr, arg2: RocStr) callconv(.C) RocStr {
++pub fn strConcatC(arg1: RocStr, arg2: RocStr) callconv(utils.cc) RocStr {
+     return @call(.always_inline, strConcat, .{ arg1, arg2 });
+ }
+ 
+@@ -1286,7 +1328,7 @@ fn strConcat(arg1: RocStr, arg2: RocStr) RocStr {
+         const combined_length = arg1.len() + arg2.len();
+ 
+         var result = arg1.reallocate(combined_length);
+-        @memcpy(result.asU8ptrMut()[arg1.len()..combined_length], arg2.asU8ptr()[0..arg2.len()]);
++        utils.memcpy(result.asU8ptrMut()[arg1.len()..combined_length], arg2.asU8ptr()[0..arg2.len()]);
+ 
+         return result;
+     }
+@@ -1328,7 +1370,7 @@ pub const RocListStr = extern struct {
+ };
+ 
+ // Str.joinWith
+-pub fn strJoinWithC(list: RocList, separator: RocStr) callconv(.C) RocStr {
++pub fn strJoinWithC(list: RocList, separator: RocStr) callconv(utils.cc) RocStr {
+     const roc_list_str = RocListStr{
+         .list_elements = @as(?[*]RocStr, @ptrCast(@alignCast(list.bytes))),
+         .list_length = list.length,
+@@ -1412,7 +1454,7 @@ test "RocStr.joinWith: result is big" {
+ }
+ 
+ // Str.toUtf8
+-pub fn strToUtf8C(arg: RocStr) callconv(.C) RocList {
++pub fn strToUtf8C(arg: RocStr) callconv(utils.cc) RocList {
+     return strToBytes(arg);
+ }
+ 
+@@ -1423,7 +1465,7 @@ inline fn strToBytes(arg: RocStr) RocList {
+     } else if (arg.isSmallStr()) {
+         const ptr = utils.allocateWithRefcount(length, RocStr.alignment, false);
+ 
+-        @memcpy(ptr[0..length], arg.asU8ptr()[0..length]);
++        utils.memcpy(ptr[0..length], arg.asU8ptr()[0..length]);
+ 
+         return RocList{ .length = length, .bytes = ptr, .capacity_or_alloc_ptr = length };
+     } else {
+@@ -1442,7 +1484,7 @@ const FromUtf8Result = extern struct {
+ pub fn fromUtf8C(
+     list: RocList,
+     update_mode: UpdateMode,
+-) callconv(.C) FromUtf8Result {
++) callconv(utils.cc) FromUtf8Result {
+     return fromUtf8(list, update_mode);
+ }
+ 
+@@ -1520,7 +1562,7 @@ fn utf8EncodeLossy(c: u32, out: []u8) u3 {
+ 
+ pub fn fromUtf8Lossy(
+     list: RocList,
+-) callconv(.C) RocStr {
++) callconv(utils.cc) RocStr {
+     if (list.len() == 0) {
+         return RocStr.empty();
+     }
+@@ -1615,7 +1657,7 @@ pub fn isValidUnicode(buf: []const u8) bool {
+     var i: usize = 0;
+     while (i + step < buf.len) {
+         var bytes: u64 = undefined;
+-        @memcpy(@as([*]u8, @ptrCast(&bytes))[0..size], buf[i..(i + size)]);
++        utils.memcpy(@as([*]u8, @ptrCast(&bytes))[0..size], buf[i..(i + size)]);
+         const unicode_bytes = bytes & 0x8080_8080_8080_8080;
+         if (unicode_bytes == 0) {
+             i += step;
+@@ -1628,7 +1670,7 @@ pub fn isValidUnicode(buf: []const u8) bool {
+             // This forces prefetching, otherwise the loop can run at about half speed.
+             if (i + 4 >= buf.len) break;
+             var small_buf: [4]u8 = undefined;
+-            @memcpy(small_buf[0..4], buf[i..(i + 4)]);
++            utils.memcpy(small_buf[0..4], buf[i..(i + 4)]);
+             // TODO: Should we always inline these function calls below?
+             if (std.unicode.utf8ByteSequenceLength(small_buf[0])) |cp_len| {
+                 if (std.meta.isError(std.unicode.utf8Decode(small_buf[0..cp_len]))) {
+@@ -1698,7 +1740,7 @@ fn expectOk(result: FromUtf8Result) !void {
+ fn sliceHelp(bytes: [*]const u8, length: usize) RocList {
+     var list = RocList.allocate(RocStr.alignment, length, @sizeOf(u8), false);
+     var list_bytes = list.bytes orelse unreachable;
+-    @memcpy(list_bytes[0..length], bytes[0..length]);
++    utils.memcpy(list_bytes[0..length], bytes[0..length]);
+     list.length = length;
+ 
+     return list;
+@@ -1958,7 +2000,7 @@ test "isWhitespace" {
+     try expect(!isWhitespace('x'));
+ }
+ 
+-pub fn strTrim(input_string: RocStr) callconv(.C) RocStr {
++pub fn strTrim(input_string: RocStr) callconv(utils.cc) RocStr {
+     var string = input_string;
+ 
+     if (string.isEmpty()) {
+@@ -2007,7 +2049,7 @@ pub fn strTrim(input_string: RocStr) callconv(.C) RocStr {
+     }
+ }
+ 
+-pub fn strTrimStart(input_string: RocStr) callconv(.C) RocStr {
++pub fn strTrimStart(input_string: RocStr) callconv(utils.cc) RocStr {
+     var string = input_string;
+ 
+     if (string.isEmpty()) {
+@@ -2055,7 +2097,7 @@ pub fn strTrimStart(input_string: RocStr) callconv(.C) RocStr {
+     }
+ }
+ 
+-pub fn strTrimEnd(input_string: RocStr) callconv(.C) RocStr {
++pub fn strTrimEnd(input_string: RocStr) callconv(utils.cc) RocStr {
+     var string = input_string;
+ 
+     if (string.isEmpty()) {
+@@ -2136,7 +2178,7 @@ fn countTrailingWhitespaceBytes(string: RocStr) usize {
+ }
+ 
+ // Str.with_ascii_lowercased
+-pub fn strWithAsciiLowercased(string: RocStr) callconv(.C) RocStr {
++pub fn strWithAsciiLowercased(string: RocStr) callconv(utils.cc) RocStr {
+     var new_str = if (string.isUnique())
+         string
+     else blk: {
+@@ -2196,7 +2238,7 @@ test "withAsciiLowercased: seamless slice" {
+ }
+ 
+ // Str.with_ascii_uppercased
+-pub fn strWithAsciiUppercased(string: RocStr) callconv(.C) RocStr {
++pub fn strWithAsciiUppercased(string: RocStr) callconv(utils.cc) RocStr {
+     var new_str = if (string.isUnique())
+         string
+     else blk: {
+@@ -2255,7 +2297,7 @@ test "withAsciiUppercased: seamless slice" {
+     try expect(str_result.eq(expected));
+ }
+ 
+-pub fn strCaselessAsciiEquals(self: RocStr, other: RocStr) callconv(.C) bool {
++pub fn strCaselessAsciiEquals(self: RocStr, other: RocStr) callconv(utils.cc) bool {
+     if (self.bytes == other.bytes and self.length == other.length) {
+         return true;
+     }
+@@ -2323,9 +2365,9 @@ test "caselessAsciiEquals: seamless slice" {
+     try expect(are_equal);
+ }
+ 
+-fn rcNone(_: ?[*]u8) callconv(.C) void {}
++fn rcNone(_: ?[*]u8) callconv(utils.cc) void {}
+ 
+-fn decStr(ptr: ?[*]u8) callconv(.C) void {
++fn decStr(ptr: ?[*]u8) callconv(utils.cc) void {
+     const str_ptr = @as(*RocStr, @ptrCast(@alignCast(ptr orelse unreachable)));
+     str_ptr.decref();
+ }
+@@ -2377,9 +2419,9 @@ const ReverseUtf8Iterator = struct {
+ 
+         return switch (slice.len) {
+             1 => @as(u21, slice[0]),
+-            2 => unicode.utf8Decode2(slice) catch unreachable,
+-            3 => unicode.utf8Decode3(slice) catch unreachable,
+-            4 => unicode.utf8Decode4(slice) catch unreachable,
++            2 => unicode.utf8Decode2(slice[0..2].*) catch unreachable,
++            3 => unicode.utf8Decode3(slice[0..3].*) catch unreachable,
++            4 => unicode.utf8Decode4(slice[0..4].*) catch unreachable,
+             else => unreachable,
+         };
+     }
+@@ -2664,7 +2706,7 @@ test "capacity: big string" {
+     try expect(data.getCapacity() >= data_bytes.len);
+ }
+ 
+-pub fn reserveC(string: RocStr, spare_u64: u64) callconv(.C) RocStr {
++pub fn reserveC(string: RocStr, spare_u64: u64) callconv(utils.cc) RocStr {
+     return reserve(string, @intCast(spare_u64));
+ }
+ 
+@@ -2680,7 +2722,7 @@ fn reserve(string: RocStr, spare: usize) RocStr {
+     }
+ }
+ 
+-pub fn withCapacityC(capacity: u64) callconv(.C) RocStr {
++pub fn withCapacityC(capacity: u64) callconv(utils.cc) RocStr {
+     var str = RocStr.allocate(@intCast(capacity));
+     str.setLen(0);
+     return str;
+@@ -2691,7 +2733,7 @@ pub fn strCloneTo(
+     ptr: [*]u8,
+     offset: usize,
+     extra_offset: usize,
+-) callconv(.C) usize {
++) callconv(utils.cc) usize {
+     const WIDTH: usize = @sizeOf(RocStr);
+     if (string.isSmallStr()) {
+         const array: [@sizeOf(RocStr)]u8 = @as([@sizeOf(RocStr)]u8, @bitCast(string));
+@@ -2710,10 +2752,10 @@ pub fn strCloneTo(
+ 
+         // write the string struct
+         const array = relative.asArray();
+-        @memcpy(ptr[offset..(offset + WIDTH)], array[0..WIDTH]);
++        utils.memcpy(ptr[offset..(offset + WIDTH)], array[0..WIDTH]);
+ 
+         // write the string bytes just after the struct
+-        @memcpy(ptr[extra_offset..(extra_offset + slice.len)], slice);
++        utils.memcpy(ptr[extra_offset..(extra_offset + slice.len)], slice);
+ 
+         return extra_offset + slice.len;
+     }
+@@ -2721,13 +2763,13 @@ pub fn strCloneTo(
+ 
+ pub fn strAllocationPtr(
+     string: RocStr,
+-) callconv(.C) ?[*]u8 {
++) callconv(utils.cc) ?[*]u8 {
+     return string.getAllocationPtr();
+ }
+ 
+ pub fn strReleaseExcessCapacity(
+     string: RocStr,
+-) callconv(.C) RocStr {
++) callconv(utils.cc) RocStr {
+     const old_length = string.len();
+     // We use the direct list.capacity_or_alloc_ptr to make sure both that there is no extra capacity and that it isn't a seamless slice.
+     if (string.isSmallStr()) {
+@@ -2743,7 +2785,7 @@ pub fn strReleaseExcessCapacity(
+         const source_ptr = string.asU8ptr();
+         const dest_ptr = output.asU8ptrMut();
+ 
+-        @memcpy(dest_ptr[0..old_length], source_ptr[0..old_length]);
++        utils.memcpy(dest_ptr[0..old_length], source_ptr[0..old_length]);
+         string.decref();
+ 
+         return output;
+diff --git a/crates/compiler/builtins/bitcode/src/utils.zig b/crates/compiler/builtins/bitcode/src/utils.zig
+index a1a8ea6d35..a11e363152 100644
+--- a/crates/compiler/builtins/bitcode/src/utils.zig
++++ b/crates/compiler/builtins/bitcode/src/utils.zig
+@@ -1,6 +1,48 @@
+ const std = @import("std");
+ const builtin = @import("builtin");
+ 
++// Check if SBF target is supported (solana-zig only)
++const has_sbf = @hasField(std.Target.Cpu.Arch, "sbf");
++
++// Check if we're compiling for Solana (SBF target)
++// On Solana, std.debug.print and other OS-specific features are unavailable
++pub const is_solana = has_sbf and builtin.cpu.arch == .sbf;
++
++// External C functions for memory operations (used by SBF targets)
++extern fn memcpy_c(dest: [*]u8, src: [*]const u8, n: usize) callconv(.c) [*]u8;
++extern fn memset_c(dest: [*]u8, c: i32, n: usize) callconv(.c) [*]u8;
++
++// Memory copy that works on SBF targets
++// On SBF, @memcpy generates llvm.memcpy.inline which requires constant sizes.
++// This wrapper uses explicit function calls for SBF to avoid that constraint.
++pub inline fn memcpy(dest: []u8, src: []const u8) void {
++    if (comptime is_solana) {
++        _ = memcpy_c(dest.ptr, src.ptr, dest.len);
++    } else {
++        @memcpy(dest, src);
++    }
++}
++
++// Memory set that works on SBF targets
++pub inline fn memset(dest: []u8, value: u8) void {
++    if (comptime is_solana) {
++        _ = memset_c(dest.ptr, @as(i32, value), dest.len);
++    } else {
++        @memset(dest, value);
++    }
++}
++
++// Determine calling convention based on target
++pub const cc: std.builtin.CallingConvention = blk: {
++    if (has_sbf and builtin.cpu.arch == .sbf) {
++        break :blk .{ .bpf_std = .{} };
++    } else if (builtin.target.cCallingConvention()) |c| {
++        break :blk c;
++    } else {
++        break :blk .auto;
++    }
++};
++
+ const DEBUG_INCDEC = false;
+ const DEBUG_TESTING_ALLOC = false;
+ const DEBUG_ALLOC = false;
+@@ -10,19 +52,19 @@ pub fn WithOverflow(comptime T: type) type {
+ }
+ 
+ // If allocation fails, this must cxa_throw - it must not return a null pointer!
+-extern fn roc_alloc(size: usize, alignment: u32) callconv(.C) ?*anyopaque;
++extern fn roc_alloc(size: usize, alignment: u32) callconv(cc) ?*anyopaque;
+ 
+ // This should never be passed a null pointer.
+ // If allocation fails, this must cxa_throw - it must not return a null pointer!
+-extern fn roc_realloc(c_ptr: *anyopaque, new_size: usize, old_size: usize, alignment: u32) callconv(.C) ?*anyopaque;
++extern fn roc_realloc(c_ptr: *anyopaque, new_size: usize, old_size: usize, alignment: u32) callconv(cc) ?*anyopaque;
+ 
+ // This should never be passed a null pointer.
+-extern fn roc_dealloc(c_ptr: *anyopaque, alignment: u32) callconv(.C) void;
++extern fn roc_dealloc(c_ptr: *anyopaque, alignment: u32) callconv(cc) void;
+ 
+-extern fn roc_dbg(loc: *anyopaque, message: *anyopaque, src: *anyopaque) callconv(.C) void;
++extern fn roc_dbg(loc: *anyopaque, message: *anyopaque, src: *anyopaque) callconv(cc) void;
+ 
+ // Since roc_dbg is never used by the builtins, we need at export a function that uses it to stop DCE.
+-pub fn test_dbg(loc: *anyopaque, src: *anyopaque, message: *anyopaque) callconv(.C) void {
++pub fn test_dbg(loc: *anyopaque, src: *anyopaque, message: *anyopaque) callconv(cc) void {
+     roc_dbg(loc, message, src);
+ }
+ 
+@@ -31,22 +73,22 @@ extern fn shm_open(name: *const i8, oflag: c_int, mode: c_uint) c_int;
+ extern fn mmap(addr: ?*anyopaque, length: c_uint, prot: c_int, flags: c_int, fd: c_int, offset: c_uint) *anyopaque;
+ extern fn getppid() c_int;
+ 
+-fn testing_roc_getppid() callconv(.C) c_int {
++fn testing_roc_getppid() callconv(cc) c_int {
+     return getppid();
+ }
+ 
+-fn roc_getppid_windows_stub() callconv(.C) c_int {
++fn roc_getppid_windows_stub() callconv(cc) c_int {
+     return 0;
+ }
+ 
+-fn testing_roc_shm_open(name: *const i8, oflag: c_int, mode: c_uint) callconv(.C) c_int {
++fn testing_roc_shm_open(name: *const i8, oflag: c_int, mode: c_uint) callconv(cc) c_int {
+     return shm_open(name, oflag, mode);
+ }
+-fn testing_roc_mmap(addr: ?*anyopaque, length: c_uint, prot: c_int, flags: c_int, fd: c_int, offset: c_uint) callconv(.C) *anyopaque {
++fn testing_roc_mmap(addr: ?*anyopaque, length: c_uint, prot: c_int, flags: c_int, fd: c_int, offset: c_uint) callconv(cc) *anyopaque {
+     return mmap(addr, length, prot, flags, fd, offset);
+ }
+ 
+-fn testing_roc_dbg(loc: *anyopaque, message: *anyopaque, src: *anyopaque) callconv(.C) void {
++fn testing_roc_dbg(loc: *anyopaque, message: *anyopaque, src: *anyopaque) callconv(cc) void {
+     _ = message;
+     _ = src;
+     _ = loc;
+@@ -55,25 +97,25 @@ fn testing_roc_dbg(loc: *anyopaque, message: *anyopaque, src: *anyopaque) callco
+ comptime {
+     // During tests, use the testing allocators to satisfy these functions.
+     if (builtin.is_test) {
+-        @export(testing_roc_alloc, .{ .name = "roc_alloc", .linkage = .strong });
+-        @export(testing_roc_realloc, .{ .name = "roc_realloc", .linkage = .strong });
+-        @export(testing_roc_dealloc, .{ .name = "roc_dealloc", .linkage = .strong });
+-        @export(testing_roc_panic, .{ .name = "roc_panic", .linkage = .strong });
+-        @export(testing_roc_dbg, .{ .name = "roc_dbg", .linkage = .strong });
++        @export(&testing_roc_alloc, .{ .name = "roc_alloc", .linkage = .strong });
++        @export(&testing_roc_realloc, .{ .name = "roc_realloc", .linkage = .strong });
++        @export(&testing_roc_dealloc, .{ .name = "roc_dealloc", .linkage = .strong });
++        @export(&testing_roc_panic, .{ .name = "roc_panic", .linkage = .strong });
++        @export(&testing_roc_dbg, .{ .name = "roc_dbg", .linkage = .strong });
+ 
+         if (builtin.os.tag == .macos or builtin.os.tag == .linux) {
+-            @export(testing_roc_getppid, .{ .name = "roc_getppid", .linkage = .strong });
+-            @export(testing_roc_mmap, .{ .name = "roc_mmap", .linkage = .strong });
+-            @export(testing_roc_shm_open, .{ .name = "roc_shm_open", .linkage = .strong });
++            @export(&testing_roc_getppid, .{ .name = "roc_getppid", .linkage = .strong });
++            @export(&testing_roc_mmap, .{ .name = "roc_mmap", .linkage = .strong });
++            @export(&testing_roc_shm_open, .{ .name = "roc_shm_open", .linkage = .strong });
+         }
+ 
+         if (builtin.os.tag == .windows) {
+-            @export(roc_getppid_windows_stub, .{ .name = "roc_getppid", .linkage = .strong });
++            @export(&roc_getppid_windows_stub, .{ .name = "roc_getppid", .linkage = .strong });
+         }
+     }
+ }
+ 
+-fn testing_roc_alloc(size: usize, nominal_alignment: u32) callconv(.C) ?*anyopaque {
++fn testing_roc_alloc(size: usize, nominal_alignment: u32) callconv(cc) ?*anyopaque {
+     const real_alignment = 16;
+     if (nominal_alignment > real_alignment) {
+         @panic("alignments larger than that of 2 usize are not currently supported");
+@@ -91,14 +133,14 @@ fn testing_roc_alloc(size: usize, nominal_alignment: u32) callconv(.C) ?*anyopaq
+ 
+     const data_ptr = @as(?*anyopaque, @ptrCast(whole_ptr + extra_bytes));
+ 
+-    if (DEBUG_TESTING_ALLOC and builtin.target.cpu.arch != .wasm32) {
++    if (DEBUG_TESTING_ALLOC and builtin.target.cpu.arch != .wasm32 and !is_solana) {
+         std.debug.print("+ alloc {*}: {} bytes\n", .{ data_ptr, size });
+     }
+ 
+     return data_ptr;
+ }
+ 
+-fn testing_roc_realloc(c_ptr: *anyopaque, new_size: usize, old_size: usize, nominal_alignment: u32) callconv(.C) ?*anyopaque {
++fn testing_roc_realloc(c_ptr: *anyopaque, new_size: usize, old_size: usize, nominal_alignment: u32) callconv(cc) ?*anyopaque {
+     const real_alignment = 16;
+     if (nominal_alignment > real_alignment) {
+         @panic("alignments larger than that of 2 usize are not currently supported");
+@@ -108,18 +150,18 @@ fn testing_roc_realloc(c_ptr: *anyopaque, new_size: usize, old_size: usize, nomi
+ 
+     const new_full_size = new_size + @sizeOf(usize);
+     var new_raw_ptr = @as([*]u8, @alignCast((std.testing.allocator.realloc(slice, new_full_size) catch unreachable).ptr));
+-    @as([*]usize, @alignCast(@ptrCast(new_raw_ptr)))[0] = new_full_size;
++    @as([*]usize, @ptrCast(@alignCast(new_raw_ptr)))[0] = new_full_size;
+     new_raw_ptr += @sizeOf(usize);
+     const new_ptr = @as(?*anyopaque, @ptrCast(new_raw_ptr));
+ 
+-    if (DEBUG_TESTING_ALLOC and builtin.target.cpu.arch != .wasm32) {
++    if (DEBUG_TESTING_ALLOC and builtin.target.cpu.arch != .wasm32 and !is_solana) {
+         std.debug.print("- realloc {*}\n", .{new_ptr});
+     }
+ 
+     return new_ptr;
+ }
+ 
+-fn testing_roc_dealloc(c_ptr: *anyopaque, _: u32) callconv(.C) void {
++fn testing_roc_dealloc(c_ptr: *anyopaque, _: u32) callconv(cc) void {
+     const alignment = 16;
+     const size_of_size = @sizeOf(usize);
+     const alignments_needed = size_of_size / alignment + comptime if (size_of_size % alignment == 0) 0 else 1;
+@@ -127,18 +169,18 @@ fn testing_roc_dealloc(c_ptr: *anyopaque, _: u32) callconv(.C) void {
+     const byte_array = @as([*]u8, @ptrCast(c_ptr)) - extra_bytes;
+     const allocation_ptr = @as([*]align(alignment) u8, @alignCast(byte_array));
+     const offset_from_allocation_to_size = extra_bytes - size_of_size;
+-    const size_of_data_and_size = @as([*]usize, @alignCast(@ptrCast(allocation_ptr)))[offset_from_allocation_to_size];
++    const size_of_data_and_size = @as([*]usize, @ptrCast(@alignCast(allocation_ptr)))[offset_from_allocation_to_size];
+     const full_size = size_of_data_and_size + offset_from_allocation_to_size;
+     const slice = allocation_ptr[0..full_size];
+ 
+-    if (DEBUG_TESTING_ALLOC and builtin.target.cpu.arch != .wasm32) {
++    if (DEBUG_TESTING_ALLOC and builtin.target.cpu.arch != .wasm32 and !is_solana) {
+         std.debug.print("💀 dealloc {*}\n", .{slice.ptr});
+     }
+ 
+     std.testing.allocator.free(slice);
+ }
+ 
+-fn testing_roc_panic(c_ptr: *anyopaque, tag_id: u32) callconv(.C) void {
++fn testing_roc_panic(c_ptr: *anyopaque, tag_id: u32) callconv(cc) void {
+     _ = c_ptr;
+     _ = tag_id;
+ 
+@@ -150,7 +192,7 @@ pub fn alloc(size: usize, alignment: u32) ?[*]u8 {
+ }
+ 
+ pub fn realloc(c_ptr: [*]u8, new_size: usize, old_size: usize, alignment: u32) [*]u8 {
+-    if (DEBUG_INCDEC and builtin.target.cpu.arch != .wasm32) {
++    if (DEBUG_INCDEC and builtin.target.cpu.arch != .wasm32 and !is_solana) {
+         std.debug.print("- realloc {*}\n", .{c_ptr});
+     }
+     return @as([*]u8, @ptrCast(roc_realloc(c_ptr, new_size, old_size, alignment)));
+@@ -162,7 +204,7 @@ pub fn dealloc(c_ptr: [*]u8, alignment: u32) void {
+ 
+ // indirection because otherwise zig creates an alias to the panic function which our LLVM code
+ // does not know how to deal with
+-pub fn test_panic(c_ptr: *anyopaque, crash_tag: u32) callconv(.C) void {
++pub fn test_panic(c_ptr: *anyopaque, crash_tag: u32) callconv(cc) void {
+     _ = c_ptr;
+     _ = crash_tag;
+ 
+@@ -174,9 +216,9 @@ pub fn test_panic(c_ptr: *anyopaque, crash_tag: u32) callconv(.C) void {
+     //    std.c.exit(1);
+ }
+ 
+-pub const Inc = fn (?[*]u8) callconv(.C) void;
+-pub const IncN = fn (?[*]u8, u64) callconv(.C) void;
+-pub const Dec = fn (?[*]u8) callconv(.C) void;
++pub const Inc = fn (?[*]u8) callconv(cc) void;
++pub const IncN = fn (?[*]u8, u64) callconv(cc) void;
++pub const Dec = fn (?[*]u8) callconv(cc) void;
+ 
+ const REFCOUNT_MAX_ISIZE: isize = 0;
+ 
+@@ -201,10 +243,10 @@ const Refcount = enum {
+ 
+ const RC_TYPE: Refcount = .atomic;
+ 
+-pub fn increfRcPtrC(ptr_to_refcount: *isize, amount: isize) callconv(.C) void {
++pub fn increfRcPtrC(ptr_to_refcount: *isize, amount: isize) callconv(cc) void {
+     if (RC_TYPE == .none) return;
+ 
+-    if (DEBUG_INCDEC and builtin.target.cpu.arch != .wasm32) {
++    if (DEBUG_INCDEC and builtin.target.cpu.arch != .wasm32 and !is_solana) {
+         std.debug.print("| increment {*}: ", .{ptr_to_refcount});
+     }
+ 
+@@ -215,7 +257,7 @@ pub fn increfRcPtrC(ptr_to_refcount: *isize, amount: isize) callconv(.C) void {
+         // As such, we do not need to cap incrementing.
+         switch (RC_TYPE) {
+             .normal => {
+-                if (DEBUG_INCDEC and builtin.target.cpu.arch != .wasm32) {
++                if (DEBUG_INCDEC and builtin.target.cpu.arch != .wasm32 and !is_solana) {
+                     const old = @as(usize, @bitCast(refcount));
+                     const new = old + @as(usize, @intCast(amount));
+ 
+@@ -236,7 +278,7 @@ pub fn decrefRcPtrC(
+     bytes_or_null: ?[*]isize,
+     alignment: u32,
+     elements_refcounted: bool,
+-) callconv(.C) void {
++) callconv(cc) void {
+     // IMPORTANT: bytes_or_null is this case is expected to be a pointer to the refcount
+     // (NOT the start of the data, or the start of the allocation)
+ 
+@@ -250,7 +292,7 @@ pub fn decrefCheckNullC(
+     bytes_or_null: ?[*]u8,
+     alignment: u32,
+     elements_refcounted: bool,
+-) callconv(.C) void {
++) callconv(cc) void {
+     if (bytes_or_null) |bytes| {
+         const isizes: [*]isize = @as([*]isize, @ptrCast(@alignCast(bytes)));
+         return @call(.always_inline, decref_ptr_to_refcount, .{ isizes - 1, alignment, elements_refcounted });
+@@ -261,7 +303,7 @@ pub fn decrefDataPtrC(
+     bytes_or_null: ?[*]u8,
+     alignment: u32,
+     elements_refcounted: bool,
+-) callconv(.C) void {
++) callconv(cc) void {
+     const bytes = bytes_or_null orelse return;
+ 
+     const data_ptr = @intFromPtr(bytes);
+@@ -277,7 +319,7 @@ pub fn decrefDataPtrC(
+ pub fn increfDataPtrC(
+     bytes_or_null: ?[*]u8,
+     inc_amount: isize,
+-) callconv(.C) void {
++) callconv(cc) void {
+     const bytes = bytes_or_null orelse return;
+ 
+     const ptr = @intFromPtr(bytes);
+@@ -293,7 +335,7 @@ pub fn freeDataPtrC(
+     bytes_or_null: ?[*]u8,
+     alignment: u32,
+     elements_refcounted: bool,
+-) callconv(.C) void {
++) callconv(cc) void {
+     const bytes = bytes_or_null orelse return;
+ 
+     const ptr = @intFromPtr(bytes);
+@@ -310,7 +352,7 @@ pub fn freeRcPtrC(
+     bytes_or_null: ?[*]isize,
+     alignment: u32,
+     elements_refcounted: bool,
+-) callconv(.C) void {
++) callconv(cc) void {
+     const bytes = bytes_or_null orelse return;
+     return free_ptr_to_refcount(bytes, alignment, elements_refcounted);
+ }
+@@ -346,7 +388,7 @@ inline fn free_ptr_to_refcount(
+     // NOTE: we don't even check whether the refcount is "infinity" here!
+     dealloc(allocation_ptr, alignment);
+ 
+-    if (DEBUG_ALLOC and builtin.target.cpu.arch != .wasm32) {
++    if (DEBUG_ALLOC and builtin.target.cpu.arch != .wasm32 and !is_solana) {
+         std.debug.print("💀 freed {*}\n", .{allocation_ptr});
+     }
+ }
+@@ -358,7 +400,7 @@ inline fn decref_ptr_to_refcount(
+ ) void {
+     if (RC_TYPE == .none) return;
+ 
+-    if (DEBUG_INCDEC and builtin.target.cpu.arch != .wasm32) {
++    if (DEBUG_INCDEC and builtin.target.cpu.arch != .wasm32 and !is_solana) {
+         std.debug.print("| decrement {*}: ", .{refcount_ptr});
+     }
+ 
+@@ -371,7 +413,7 @@ inline fn decref_ptr_to_refcount(
+     if (!rcConstant(refcount)) {
+         switch (RC_TYPE) {
+             .normal => {
+-                if (DEBUG_INCDEC and builtin.target.cpu.arch != .wasm32) {
++                if (DEBUG_INCDEC and builtin.target.cpu.arch != .wasm32 and !is_solana) {
+                     const old = @as(usize, @bitCast(refcount));
+                     const new = @as(usize, @bitCast(refcount_ptr[0] -% 1));
+ 
+@@ -396,7 +438,7 @@ inline fn decref_ptr_to_refcount(
+ 
+ pub fn isUnique(
+     bytes_or_null: ?[*]u8,
+-) callconv(.C) bool {
++) callconv(cc) bool {
+     const bytes = bytes_or_null orelse return true;
+ 
+     const ptr = @intFromPtr(bytes);
+@@ -407,7 +449,7 @@ pub fn isUnique(
+ 
+     const refcount = (isizes - 1)[0];
+ 
+-    if (DEBUG_INCDEC and builtin.target.cpu.arch != .wasm32) {
++    if (DEBUG_INCDEC and builtin.target.cpu.arch != .wasm32 and !is_solana) {
+         std.debug.print("| is unique {*}\n", .{isizes - 1});
+     }
+ 
+@@ -495,7 +537,7 @@ pub fn allocateWithRefcountC(
+     data_bytes: usize,
+     element_alignment: u32,
+     elements_refcounted: bool,
+-) callconv(.C) [*]u8 {
++) callconv(cc) [*]u8 {
+     return allocateWithRefcount(data_bytes, element_alignment, elements_refcounted);
+ }
+ 
+@@ -514,7 +556,7 @@ pub fn allocateWithRefcount(
+ 
+     const new_bytes: [*]u8 = alloc(length, alignment) orelse unreachable;
+ 
+-    if (DEBUG_ALLOC and builtin.target.cpu.arch != .wasm32) {
++    if (DEBUG_ALLOC and builtin.target.cpu.arch != .wasm32 and !is_solana) {
+         std.debug.print("+ allocated {*} ({} bytes with alignment {})\n", .{ new_bytes, data_bytes, alignment });
+     }
+ 
+@@ -591,6 +633,6 @@ test "increfC, static data" {
+ // Note: On esstentially all OSes, this will be affected by ASLR and different each run.
+ // In wasm, the value will be constant to the build as a whole.
+ // Either way, it can not be know by an attacker unless they get access to the executable.
+-pub fn dictPseudoSeed() callconv(.C) u64 {
++pub fn dictPseudoSeed() callconv(cc) u64 {
+     return @as(u64, @intCast(@intFromPtr(&dictPseudoSeed)));
+ }
+diff --git a/crates/compiler/builtins/src/bitcode.rs b/crates/compiler/builtins/src/bitcode.rs
+index 34f5e60883..11ce52ea02 100644
+--- a/crates/compiler/builtins/src/bitcode.rs
++++ b/crates/compiler/builtins/src/bitcode.rs
+@@ -43,7 +43,7 @@ impl FloatWidth {
+         match self {
+             F32 => 4,
+             F64 => match target.architecture() {
+-                X86_64 | Aarch64 | Wasm32 => 8,
++                X86_64 | Aarch64 | Wasm32 | Sbf => 8,
+                 X86_32 | Aarch32 => 4,
+             },
+         }
+@@ -117,7 +117,8 @@ impl IntWidth {
+                 Architecture::X86_64
+                 | Architecture::Aarch64
+                 | Architecture::Aarch32
+-                | Architecture::Wasm32 => 8,
++                | Architecture::Wasm32
++                | Architecture::Sbf => 8,
+                 Architecture::X86_32 => 4,
+             },
+             U128 | I128 => {
+@@ -127,7 +128,10 @@ impl IntWidth {
+                 // however, rust does not always think that this is true
+                 // Our alignmets here are correct, but they will not match rust/zig/llvm until they update to llvm version 18.
+                 match target.architecture() {
+-                    Architecture::X86_64 | Architecture::Aarch64 | Architecture::X86_32 => 16,
++                    Architecture::X86_64
++                    | Architecture::Aarch64
++                    | Architecture::X86_32
++                    | Architecture::Sbf => 16,
+                     Architecture::Aarch32 | Architecture::Wasm32 => 8,
+                 }
+             }
+diff --git a/crates/compiler/gen_dev/src/object_builder.rs b/crates/compiler/gen_dev/src/object_builder.rs
+index 9ce6b3ff70..58b1d64883 100644
+--- a/crates/compiler/gen_dev/src/object_builder.rs
++++ b/crates/compiler/gen_dev/src/object_builder.rs
+@@ -416,6 +416,10 @@ fn create_relocation(target: Target, symbol: SymbolId, offset: u64) -> write::Re
+             },
+             -4,
+         ),
++        // SBF uses LLVM backend, not dev backend
++        roc_target::Architecture::Sbf => {
++            unreachable!("SBF target should use LLVM backend, not dev backend")
++        }
+     };
+ 
+     write::Relocation {
+diff --git a/crates/compiler/gen_llvm/src/llvm/bitcode.rs b/crates/compiler/gen_llvm/src/llvm/bitcode.rs
+index 4feaf0b611..5c28b32da4 100644
+--- a/crates/compiler/gen_llvm/src/llvm/bitcode.rs
++++ b/crates/compiler/gen_llvm/src/llvm/bitcode.rs
+@@ -840,17 +840,39 @@ impl<'ctx> BitcodeReturnValue<'ctx> {
+         arguments: &[BasicValueEnum<'ctx>],
+         fn_name: &str,
+     ) -> BasicValueEnum<'ctx> {
++        // SBF builtins return structs by value, not via sret pointer
++        let is_sbf = env.target.architecture() == roc_target::Architecture::Sbf;
++
+         match self {
+             BitcodeReturnValue::List(result) => {
+-                call_void_bitcode_fn(env, arguments, fn_name);
+-                env.builder
+-                    .new_build_load(zig_list_type(env), *result, "load_list")
++                if is_sbf {
++                    // SBF: function returns struct by value, skip sret pointer argument
++                    let args_without_sret = &arguments[1..]; // Skip the sret pointer
++                    let value = call_bitcode_fn(env, args_without_sret, fn_name);
++                    // Store the returned struct into the alloca
++                    env.builder.new_build_store(*result, value);
++                    env.builder
++                        .new_build_load(zig_list_type(env), *result, "load_list")
++                } else {
++                    call_void_bitcode_fn(env, arguments, fn_name);
++                    env.builder
++                        .new_build_load(zig_list_type(env), *result, "load_list")
++                }
+             }
+             BitcodeReturnValue::Str(result) => {
+-                call_void_bitcode_fn(env, arguments, fn_name);
+-
+-                // we keep a string in the alloca
+-                (*result).into()
++                if is_sbf {
++                    // SBF: function returns struct by value, skip sret pointer argument
++                    let args_without_sret = &arguments[1..]; // Skip the sret pointer
++                    let value = call_bitcode_fn(env, args_without_sret, fn_name);
++                    // Store the returned struct into the alloca
++                    env.builder.new_build_store(*result, value);
++                    // we keep a string in the alloca
++                    (*result).into()
++                } else {
++                    call_void_bitcode_fn(env, arguments, fn_name);
++                    // we keep a string in the alloca
++                    (*result).into()
++                }
+             }
+             BitcodeReturnValue::Basic => call_bitcode_fn(env, arguments, fn_name),
+         }
+@@ -1133,14 +1155,24 @@ pub(crate) fn call_str_bitcode_fn<'ctx>(
+ 
+             returns.call_and_load_32bit(env, &arguments, fn_name)
+         }
+-        X86_64 | Aarch64 => {
++        X86_64 | Aarch64 | Sbf => {
++            let is_sbf = env.target.architecture() == Sbf;
+             let capacity = other_arguments.len() + strings.len() + returns.additional_arguments();
+             let mut arguments: Vec<BasicValueEnum> = Vec::with_capacity_in(capacity, env.arena);
+ 
+             let return_value = returns.return_value_64bit(env, &mut arguments);
+ 
+             for string in strings {
+-                arguments.push(pass_string_to_zig_64bit(env, *string).into());
++                let str_ptr = pass_string_to_zig_64bit(env, *string);
++                if is_sbf {
++                    // SBF: load struct value from pointer (builtins expect by-value args)
++                    let str_type = super::convert::zig_str_type(env);
++                    let str_value = env.builder.new_build_load(str_type, str_ptr, "load_str");
++                    arguments.push(str_value);
++                } else {
++                    // x86_64/aarch64: pass pointer directly (sret convention)
++                    arguments.push(str_ptr.into());
++                }
+             }
+ 
+             arguments.extend(other_arguments);
+@@ -1188,12 +1220,20 @@ pub(crate) fn call_void_list_bitcode_fn<'ctx>(
+ 
+             call_void_bitcode_fn(env, &arguments, fn_name);
+         }
+-        X86_64 | Aarch64 => {
++        X86_64 | Aarch64 | Sbf => {
++            let is_sbf = env.target.architecture() == Sbf;
+             let capacity = other_arguments.len() + lists.len();
+             let mut arguments: Vec<BasicValueEnum> = Vec::with_capacity_in(capacity, env.arena);
+ 
+             for list in lists {
+-                arguments.push(pass_list_to_zig_64bit(env, (*list).into()).into());
++                let list_ptr = pass_list_to_zig_64bit(env, (*list).into());
++                if is_sbf {
++                    let list_type = super::convert::zig_list_type(env);
++                    let list_value = env.builder.new_build_load(list_type, list_ptr, "load_list");
++                    arguments.push(list_value);
++                } else {
++                    arguments.push(list_ptr.into());
++                }
+             }
+ 
+             arguments.extend(other_arguments);
+@@ -1240,14 +1280,22 @@ pub(crate) fn call_list_bitcode_fn<'ctx>(
+ 
+             returns.call_and_load_32bit(env, &arguments, fn_name)
+         }
+-        X86_64 | Aarch64 => {
++        X86_64 | Aarch64 | Sbf => {
++            let is_sbf = env.target.architecture() == Sbf;
+             let capacity = other_arguments.len() + lists.len() + returns.additional_arguments();
+             let mut arguments: Vec<BasicValueEnum> = Vec::with_capacity_in(capacity, env.arena);
+ 
+             let return_value = returns.return_value_64bit(env, &mut arguments);
+ 
+             for list in lists {
+-                arguments.push(pass_list_to_zig_64bit(env, (*list).into()).into());
++                let list_ptr = pass_list_to_zig_64bit(env, (*list).into());
++                if is_sbf {
++                    let list_type = super::convert::zig_list_type(env);
++                    let list_value = env.builder.new_build_load(list_type, list_ptr, "load_list");
++                    arguments.push(list_value);
++                } else {
++                    arguments.push(list_ptr.into());
++                }
+             }
+ 
+             arguments.extend(other_arguments);
+diff --git a/crates/compiler/gen_llvm/src/llvm/build.rs b/crates/compiler/gen_llvm/src/llvm/build.rs
+index 1dca00d0b2..f8df08c872 100644
+--- a/crates/compiler/gen_llvm/src/llvm/build.rs
++++ b/crates/compiler/gen_llvm/src/llvm/build.rs
+@@ -6,7 +6,7 @@ use crate::llvm::convert::{
+     argument_type_from_layout, basic_type_from_builtin, basic_type_from_layout, zig_str_type,
+ };
+ use crate::llvm::expect::{clone_to_shared_memory, SharedMemoryPointer};
+-use crate::llvm::memcpy::build_memcpy;
++use crate::llvm::memcpy::{build_memcpy, build_memcpy_raw};
+ use crate::llvm::refcounting::{
+     build_reset, decrement_refcount_layout, increment_refcount_layout, PointerToRefcount,
+ };
+@@ -1035,6 +1035,9 @@ pub fn module_from_builtins<'ctx>(
+             Target::WinX64 => {
+                 include_bytes!("../../../builtins/bitcode/zig-out/builtins-windows-x86_64.bc")
+             }
++            Target::Sbf => {
++                include_bytes!("../../../builtins/bitcode/zig-out/builtins-sbf.bc")
++            }
+             _ => panic!("The zig builtins are not currently built for this target: {target:?}"),
+         }
+     };
+@@ -1102,6 +1105,12 @@ pub fn module_from_builtins<'ctx>(
+     module
+ }
+ 
++fn fix_inline_intrinsics_for_sbf<'ctx>(_ctx: &'ctx Context, _module: &Module<'ctx>) {
++    // TODO: Implement inline intrinsic replacement for SBF
++    // Currently, the builtins use utils.memcpy/utils.memset wrappers
++    // which call external C functions instead of @memcpy/@memset for SBF
++}
++
+ fn promote_to_main_function<'a, 'ctx>(
+     env: &Env<'a, 'ctx, '_>,
+     layout_interner: &STLayoutInterner<'a>,
+@@ -2925,9 +2934,14 @@ fn list_literal<'a, 'ctx>(
+         let byte_size = env
+             .ptr_int()
+             .const_int(list_length as u64 * element_width as u64, false);
+-        builder
+-            .build_memcpy(data_ptr, alignment, const_data_ptr, alignment, byte_size)
+-            .unwrap();
++        build_memcpy_raw(
++            env,
++            data_ptr,
++            alignment,
++            const_data_ptr,
++            alignment,
++            byte_size,
++        );
+ 
+         super::build_list::store_list(env, data_ptr, list_length_intval).into()
+     } else {
+@@ -3269,15 +3283,14 @@ pub(crate) fn build_exp_stmt<'a, 'ctx>(
+                             layout_interner.get_repr(layout),
+                         );
+                         let tmp = create_entry_block_alloca(env, basic_type, "tmp_output_for_jmp");
+-                        builder
+-                            .build_memcpy(
+-                                tmp,
+-                                alignment,
+-                                value.into_pointer_value(),
+-                                alignment,
+-                                env.ptr_int().const_int(size as _, false),
+-                            )
+-                            .unwrap();
++                        build_memcpy_raw(
++                            env,
++                            tmp,
++                            alignment,
++                            value.into_pointer_value(),
++                            alignment,
++                            env.ptr_int().const_int(size as _, false),
++                        );
+                         to_resolve.push((alloca, tmp, alignment, size));
+                     }
+                     crate::llvm::scope::JoinPointArg::Phi(phi) => {
+@@ -3286,15 +3299,14 @@ pub(crate) fn build_exp_stmt<'a, 'ctx>(
+                 }
+             }
+             for (alloca, tmp, alignment, size) in to_resolve {
+-                builder
+-                    .build_memcpy(
+-                        *alloca,
+-                        alignment,
+-                        tmp,
+-                        alignment,
+-                        env.ptr_int().const_int(size as _, false),
+-                    )
+-                    .unwrap();
++                build_memcpy_raw(
++                    env,
++                    *alloca,
++                    alignment,
++                    tmp,
++                    alignment,
++                    env.ptr_int().const_int(size as _, false),
++                );
+             }
+ 
+             builder.new_build_unconditional_branch(*cont_block);
+@@ -6549,9 +6561,8 @@ pub fn to_cc_return<'a>(
+         roc_target::OperatingSystem::Windows => return_size > env.target.ptr_width() as u32,
+         roc_target::OperatingSystem::Linux
+         | roc_target::OperatingSystem::Mac
+-        | roc_target::OperatingSystem::Freestanding => {
+-            return_size > 2 * env.target.ptr_width() as u32
+-        }
++        | roc_target::OperatingSystem::Freestanding
++        | roc_target::OperatingSystem::Solana => return_size > 2 * env.target.ptr_width() as u32,
+     };
+ 
+     if return_size == 0 {
+diff --git a/crates/compiler/gen_llvm/src/llvm/build_str.rs b/crates/compiler/gen_llvm/src/llvm/build_str.rs
+index 3a7e3fa653..a0fbbb2776 100644
+--- a/crates/compiler/gen_llvm/src/llvm/build_str.rs
++++ b/crates/compiler/gen_llvm/src/llvm/build_str.rs
+@@ -43,7 +43,7 @@ pub(crate) fn call_str_from_utf_bitcode_fn<'a, 'ctx>(
+             args.push(a.into());
+             args.push(b.into());
+         }
+-        Aarch64 | X86_64 => {
++        Aarch64 | X86_64 | Sbf => {
+             let list = pass_list_to_zig_64bit(env, list);
+             args.push(list.into());
+         }
+diff --git a/crates/compiler/gen_llvm/src/llvm/expect.rs b/crates/compiler/gen_llvm/src/llvm/expect.rs
+index 9c684ecd67..e56455c84d 100644
+--- a/crates/compiler/gen_llvm/src/llvm/expect.rs
++++ b/crates/compiler/gen_llvm/src/llvm/expect.rs
+@@ -22,6 +22,7 @@ use roc_region::all::Region;
+ use super::build::BuilderExt;
+ use super::build::{add_func, FunctionSpec, LlvmBackendMode};
+ use super::convert::struct_type_from_union_layout;
++use super::memcpy::build_memcpy_raw;
+ use super::scope::Scope;
+ use super::struct_::RocStruct;
+ 
+@@ -1016,7 +1017,7 @@ fn build_clone_builtin<'a, 'ctx>(
+                     env.context.ptr_type(AddressSpace::default()),
+                     "to_bytes_pointer",
+                 );
+-                bd.build_memcpy(dest, 1, src, 1, elements_width).unwrap();
++                build_memcpy_raw(env, dest, 1, src, 1, elements_width);
+ 
+                 bd.new_build_int_add(elements_start_offset, elements_width, "new_offset")
+             } else {
+diff --git a/crates/compiler/gen_llvm/src/llvm/lowlevel.rs b/crates/compiler/gen_llvm/src/llvm/lowlevel.rs
+index 4cc8890039..d8eb7b0b47 100644
+--- a/crates/compiler/gen_llvm/src/llvm/lowlevel.rs
++++ b/crates/compiler/gen_llvm/src/llvm/lowlevel.rs
+@@ -255,7 +255,7 @@ pub(crate) fn run_low_level<'a, 'ctx>(
+                         }
+                     }
+                 }
+-                Aarch64 | X86_64 => {
++                Aarch64 | X86_64 | Sbf => {
+                     let (type_name, width) = {
+                         match layout_interner.get_repr(number_layout) {
+                             LayoutRepr::Builtin(Builtin::Int(int_width)) => {
+@@ -2037,7 +2037,7 @@ fn dec_alloca<'ctx>(env: &Env<'_, 'ctx, '_>, value: IntValue<'ctx>) -> BasicValu
+             env.builder
+                 .new_build_load(i64_type.array_type(2), alloca, "load as array")
+         }
+-        Freestanding => unimplemented!(),
++        Freestanding | Solana => unimplemented!(),
+     }
+ }
+ 
+diff --git a/crates/compiler/gen_llvm/src/llvm/memcpy.rs b/crates/compiler/gen_llvm/src/llvm/memcpy.rs
+index 7e82782bb1..cfacac7dbb 100644
+--- a/crates/compiler/gen_llvm/src/llvm/memcpy.rs
++++ b/crates/compiler/gen_llvm/src/llvm/memcpy.rs
+@@ -1,5 +1,9 @@
+-use inkwell::{types::BasicType, values::PointerValue};
++use inkwell::{
++    types::BasicType,
++    values::{IntValue, PointerValue},
++};
+ use roc_mono::layout::{LayoutRepr, STLayoutInterner};
++use roc_target::Target;
+ 
+ use super::{align::LlvmAlignment, build::Env, convert::basic_type_from_layout};
+ 
+@@ -16,8 +20,75 @@ pub fn build_memcpy<'a, 'ctx>(
+         .unwrap();
+     if align_bytes > 0 {
+         // There is actually something to memcpy.
++        // For SBF targets, use regular memcpy function call instead of llvm.memcpy.inline
++        // because the inline intrinsic requires immediate (constant) sizes.
++        if matches!(env.target, Target::Sbf) {
++            // Call memcpy function directly for SBF
++            build_memcpy_call(env, destination, source, width);
++        } else {
++            env.builder
++                .build_memcpy(destination, align_bytes, source, align_bytes, width)
++                .unwrap();
++        }
++    }
++}
++
++/// Build a call to memcpy function instead of using the inline intrinsic.
++/// This is needed for SBF targets where llvm.memcpy.inline doesn't work with variable sizes.
++fn build_memcpy_call<'ctx>(
++    env: &Env<'_, 'ctx, '_>,
++    destination: PointerValue<'ctx>,
++    source: PointerValue<'ctx>,
++    size: IntValue<'ctx>,
++) {
++    let i8_ptr_type = env.context.ptr_type(inkwell::AddressSpace::default());
++    let i64_type = env.context.i64_type();
++
++    // Get or declare memcpy function
++    let memcpy_fn = match env.module.get_function("memcpy") {
++        Some(f) => f,
++        None => {
++            let fn_type = i8_ptr_type.fn_type(
++                &[i8_ptr_type.into(), i8_ptr_type.into(), i64_type.into()],
++                false,
++            );
++            env.module.add_function("memcpy", fn_type, None)
++        }
++    };
++
++    // Convert size to i64 if needed
++    let size_i64 = env
++        .builder
++        .build_int_z_extend_or_bit_cast(size, i64_type, "size_i64")
++        .unwrap();
++
++    env.builder
++        .build_call(
++            memcpy_fn,
++            &[destination.into(), source.into(), size_i64.into()],
++            "memcpy_call",
++        )
++        .unwrap();
++}
++
++/// Build memcpy with raw size and alignment parameters.
++/// This is a drop-in replacement for builder.build_memcpy() that handles SBF targets correctly.
++/// For SBF, it uses a regular memcpy function call instead of llvm.memcpy.inline intrinsic.
++pub fn build_memcpy_raw<'a, 'ctx>(
++    env: &Env<'a, 'ctx, '_>,
++    destination: PointerValue<'ctx>,
++    dest_align: u32,
++    source: PointerValue<'ctx>,
++    src_align: u32,
++    size: IntValue<'ctx>,
++) {
++    // For SBF targets, use regular memcpy function call instead of llvm.memcpy.inline
++    // because the inline intrinsic requires immediate (constant) sizes.
++    if matches!(env.target, Target::Sbf) {
++        build_memcpy_call(env, destination, source, size);
++    } else {
+         env.builder
+-            .build_memcpy(destination, align_bytes, source, align_bytes, width)
++            .build_memcpy(destination, dest_align, source, src_align, size)
+             .unwrap();
+     }
+ }
+diff --git a/crates/compiler/roc_target/src/lib.rs b/crates/compiler/roc_target/src/lib.rs
+index b8a1307511..2c66cf376c 100644
+--- a/crates/compiler/roc_target/src/lib.rs
++++ b/crates/compiler/roc_target/src/lib.rs
+@@ -16,6 +16,7 @@ pub enum OperatingSystem {
+     Linux,
+     Mac,
+     Windows,
++    Solana,
+ }
+ 
+ impl std::fmt::Display for OperatingSystem {
+@@ -25,6 +26,7 @@ impl std::fmt::Display for OperatingSystem {
+             OperatingSystem::Linux => "linux",
+             OperatingSystem::Mac => "macos",
+             OperatingSystem::Windows => "windows",
++            OperatingSystem::Solana => "solana",
+         };
+         write!(f, "{}", arch_str)
+     }
+@@ -44,6 +46,7 @@ pub enum Architecture {
+     Wasm32,
+     X86_32,
+     X86_64,
++    Sbf,
+ }
+ 
+ impl std::fmt::Display for Architecture {
+@@ -54,6 +57,7 @@ impl std::fmt::Display for Architecture {
+             Architecture::Wasm32 => "wasm32",
+             Architecture::X86_32 => "x86_32",
+             Architecture::X86_64 => "x86_64",
++            Architecture::Sbf => "sbf",
+         };
+         write!(f, "{}", arch_str)
+     }
+@@ -64,7 +68,7 @@ impl Architecture {
+         use Architecture::*;
+ 
+         match self {
+-            X86_64 | Aarch64 => PtrWidth::Bytes8,
++            X86_64 | Aarch64 | Sbf => PtrWidth::Bytes8,
+             X86_32 | Aarch32 | Wasm32 => PtrWidth::Bytes4,
+         }
+     }
+@@ -85,6 +89,7 @@ pub enum Target {
+     WinX64,
+     WinArm64,
+     Wasm32,
++    Sbf,
+ }
+ 
+ #[derive(Debug, PartialEq, Eq)]
+@@ -101,6 +106,7 @@ impl Target {
+             LinuxX64 | WinX64 | MacX64 => Architecture::X86_64,
+             LinuxArm64 | WinArm64 | MacArm64 => Architecture::Aarch64,
+             Wasm32 => Architecture::Wasm32,
++            Sbf => Architecture::Sbf,
+         }
+     }
+ 
+@@ -111,6 +117,7 @@ impl Target {
+             MacX64 | MacArm64 => OperatingSystem::Mac,
+             WinX32 | WinX64 | WinArm64 => OperatingSystem::Windows,
+             Wasm32 => OperatingSystem::Freestanding,
++            Sbf => OperatingSystem::Solana,
+         }
+     }
+ 
+@@ -145,7 +152,7 @@ impl Target {
+     pub const fn object_file_ext(&self) -> &str {
+         use Target::*;
+         match self {
+-            LinuxX32 | LinuxX64 | LinuxArm64 | MacX64 | MacArm64 => "o",
++            LinuxX32 | LinuxX64 | LinuxArm64 | MacX64 | MacArm64 | Sbf => "o",
+             WinX32 | WinX64 | WinArm64 => "obj",
+             Wasm32 => "wasm",
+         }
+@@ -155,7 +162,7 @@ impl Target {
+     pub const fn static_library_file_ext(&self) -> &str {
+         use Target::*;
+         match self {
+-            LinuxX32 | LinuxX64 | LinuxArm64 | MacX64 | MacArm64 => "a",
++            LinuxX32 | LinuxX64 | LinuxArm64 | MacX64 | MacArm64 | Sbf => "a",
+             WinX32 | WinX64 | WinArm64 => "lib",
+             Wasm32 => "wasm",
+         }
+@@ -165,7 +172,7 @@ impl Target {
+     pub const fn dynamic_library_file_ext(&self) -> &str {
+         use Target::*;
+         match self {
+-            LinuxX32 | LinuxX64 | LinuxArm64 => "so",
++            LinuxX32 | LinuxX64 | LinuxArm64 | Sbf => "so",
+             MacX64 | MacArm64 => "dylib",
+             WinX32 | WinX64 | WinArm64 => "dll",
+             Wasm32 => "wasm",
+@@ -179,6 +186,7 @@ impl Target {
+             LinuxX32 | LinuxX64 | LinuxArm64 | MacX64 | MacArm64 => None,
+             WinX32 | WinX64 | WinArm64 => Some("exe"),
+             Wasm32 => Some("wasm"),
++            Sbf => Some("so"),
+         }
+     }
+ 
+@@ -187,7 +195,7 @@ impl Target {
+     pub fn prebuilt_static_object(&self) -> String {
+         use Target::*;
+         match self {
+-            LinuxX32 | LinuxX64 | LinuxArm64 | MacX64 | MacArm64 | Wasm32 => {
++            LinuxX32 | LinuxX64 | LinuxArm64 | MacX64 | MacArm64 | Wasm32 | Sbf => {
+                 format!("{}.o", self)
+             }
+             WinX32 | WinX64 | WinArm64 => {
+@@ -201,7 +209,7 @@ impl Target {
+     pub fn prebuilt_static_library(&self) -> String {
+         use Target::*;
+         match self {
+-            LinuxX32 | LinuxX64 | LinuxArm64 | MacX64 | MacArm64 | Wasm32 => {
++            LinuxX32 | LinuxX64 | LinuxArm64 | MacX64 | MacArm64 | Wasm32 | Sbf => {
+                 format!("{}.a", self)
+             }
+             WinX32 | WinX64 | WinArm64 => {
+@@ -336,6 +344,7 @@ impl FromStr for Target {
+             "windows-x64" => Ok(WinX64),
+             "windows-arm64" => Ok(WinArm64),
+             "wasm32" => Ok(Wasm32),
++            "sbf" | "solana" | "sbfsolana" => Ok(Sbf),
+             _ => Err(ParseError::InvalidTargetString),
+         }
+     }
+@@ -362,6 +371,7 @@ impl From<&Target> for &'static str {
+             WinX64 => "windows-x64",
+             WinArm64 => "windows-arm64",
+             Wasm32 => "wasm32",
++            Sbf => "sbf",
+         }
+     }
+ }
+@@ -452,6 +462,7 @@ impl TryFrom<(Architecture, OperatingSystem)> for Target {
+             (Architecture::X86_64, OperatingSystem::Mac) => Ok(Target::MacX64),
+             (Architecture::Aarch64, OperatingSystem::Mac) => Ok(Target::MacArm64),
+             (Architecture::Wasm32, _) => Ok(Target::Wasm32),
++            (Architecture::Sbf, _) => Ok(Target::Sbf),
+             _ => Err(TargetFromTripleError::TripleUnsupported),
+         }
+     }
+diff --git a/crates/glue/src/types.rs b/crates/glue/src/types.rs
+index 3f6c95f4cd..21adacbd5b 100644
+--- a/crates/glue/src/types.rs
++++ b/crates/glue/src/types.rs
+@@ -922,18 +922,19 @@ impl From<Architecture> for roc_type::Architecture {
+             Architecture::Wasm32 => roc_type::Architecture::Wasm32,
+             Architecture::X86_32 => roc_type::Architecture::X86x32,
+             Architecture::X86_64 => roc_type::Architecture::X86x64,
++            Architecture::Sbf => roc_type::Architecture::Aarch64,
+         }
+     }
+ }
+ 
+ impl From<OperatingSystem> for roc_type::OperatingSystem {
+     fn from(os: OperatingSystem) -> Self {
+-        // TODO: Update Glue to new OS Tags.
+         match os {
+             OperatingSystem::Windows => roc_type::OperatingSystem::Windows,
+             OperatingSystem::Linux => roc_type::OperatingSystem::Linux,
+             OperatingSystem::Mac => roc_type::OperatingSystem::Mac,
+             OperatingSystem::Freestanding => roc_type::OperatingSystem::Freestanding,
++            OperatingSystem::Solana => roc_type::OperatingSystem::Freestanding,
+         }
+     }
+ }
+diff --git a/src/cli/builder.zig b/src/cli/builder.zig
+index c5c174f5c6..76ea48b2e0 100644
+--- a/src/cli/builder.zig
++++ b/src/cli/builder.zig
+@@ -123,6 +123,8 @@ const LLVMCodeGenLevelAggressive: c_int = 3;
+ 
+ // LLVM Relocation Models
+ const LLVMRelocDefault: c_int = 0;
++const LLVMRelocStatic: c_int = 1;
++const LLVMRelocPIC: c_int = 2;
+ 
+ // LLVM Code Models
+ const LLVMCodeModelDefault: c_int = 0;
+@@ -252,14 +254,20 @@ pub fn compileBitcodeToObject(gpa: Allocator, config: CompileConfig) !bool {
+     const features_z = try gpa.dupeZ(u8, config.features);
+     defer gpa.free(features_z);
+ 
+-    std.log.debug("Creating target machine with CPU='{s}', Features='{s}'", .{ config.cpu, config.features });
++    // Use PIC relocation model for SBF/Solana targets (required for shared library)
++    const reloc_model = if (config.target == .sbfsolana)
++        LLVMRelocPIC
++    else
++        LLVMRelocDefault;
++
++    std.log.debug("Creating target machine with CPU='{s}', Features='{s}', Reloc={}", .{ config.cpu, config.features, reloc_model });
+     const target_machine = externs.ZigLLVMCreateTargetMachine(
+         llvm_target,
+         target_triple_z.ptr,
+         cpu_z.ptr,
+         features_z.ptr,
+         config.optimization.toLLVMLevel(),
+-        LLVMRelocDefault,
++        reloc_model,
+         LLVMCodeModelDefault,
+         false, // function_sections
+         false, // data_sections
+diff --git a/src/cli/linker.zig b/src/cli/linker.zig
+index 634ab0a7d0..33992cbcb0 100644
+--- a/src/cli/linker.zig
++++ b/src/cli/linker.zig
+@@ -28,6 +28,7 @@ pub const TargetFormat = enum {
+     coff,
+     macho,
+     wasm,
++    sbf, // Solana BPF format
+ 
+     /// Automatically detect target format based on the current system
+     pub fn detectFromSystem() TargetFormat {
+@@ -35,6 +36,7 @@ pub const TargetFormat = enum {
+             .windows => .coff,
+             .macos, .ios, .watchos, .tvos => .macho,
+             .freestanding => .wasm,
++            .solana => .sbf,
+             else => .elf,
+         };
+     }
+@@ -45,6 +47,7 @@ pub const TargetFormat = enum {
+             .windows => .coff,
+             .macos, .ios, .watchos, .tvos => .macho,
+             .freestanding => .wasm,
++            .solana => .sbf,
+             else => .elf,
+         };
+     }
+@@ -324,6 +327,87 @@ fn buildLinkArgs(ctx: *CliContext, config: LinkConfig) LinkError!std.array_list.
+             try args.append("-z");
+             try args.append(stack_size_str);
+         },
++        .solana => {
++            // Solana BPF/SBF linker (ld.lld for SBF target)
++            try args.append("ld.lld");
++
++            // Add output argument
++            try args.append("-o");
++            try args.append(config.output_path);
++
++            // Suppress LLD warnings
++            try args.append("-w");
++
++            // Allow undefined symbols (Solana syscalls are resolved at runtime by BPF loader)
++            try args.append("--unresolved-symbols=ignore-all");
++
++            // Disable garbage collection to preserve entrypoint
++            try args.append("--no-gc-sections");
++
++            // Generate shared library (Solana programs are .so files)
++            try args.append("-shared");
++
++            // Set entry point to entrypoint symbol
++            try args.append("-e");
++            try args.append("entrypoint");
++
++            // Enable relaxed relocations to allow non-PIC code in shared library
++            try args.append("-z");
++            try args.append("notext");
++
++            // Strip ALL symbols and debug info
++            try args.append("--strip-all");
++
++            // Discard all local symbols
++            try args.append("--discard-all");
++
++            // Create and use an inline linker script via --script
++            // This MUST be done to discard .eh_frame and .data sections
++            // Solana BPF programs cannot have writable data sections
++            // We write the linker script to a temporary file in the output directory
++            const output_dir = std.fs.path.dirname(config.output_path) orelse ".";
++            const linker_script_path = std.fs.path.join(ctx.arena, &.{ output_dir, "solana_bpf.ld" }) catch return LinkError.OutOfMemory;
++
++            // Write linker script to file
++            // CRITICAL: Solana BPF loader rejects any writable sections except .dynamic
++            // - .data must be discarded or merged into .rodata
++            // - .eh_frame causes non-PIC relocation errors and must be discarded
++            const linker_script_content =
++                \\PHDRS
++                \\{
++                \\text PT_LOAD ;
++                \\rodata PT_LOAD ;
++                \\dynamic PT_DYNAMIC ;
++                \\}
++                \\
++                \\SECTIONS
++                \\{
++                \\. = SIZEOF_HEADERS;
++                \\.text : { *(.text*) } :text
++                \\.rodata : { *(.rodata*) *(.data*) *(.bss*) } :rodata
++                \\.dynamic : { *(.dynamic) } :dynamic
++                \\.dynsym : { *(.dynsym) } :rodata
++                \\.dynstr : { *(.dynstr) } :rodata
++                \\.rel.dyn : { *(.rel.dyn) } :rodata
++                \\/DISCARD/ : {
++                \\*(.eh_frame*)
++                \\*(.gnu.hash*)
++                \\*(.hash*)
++                \\*(.comment*)
++                \\*(.note*)
++                \\}
++                \\}
++            ;
++
++            // Write the linker script to the file
++            const linker_script_file = std.fs.cwd().createFile(linker_script_path, .{}) catch return LinkError.OutOfMemory;
++            defer linker_script_file.close();
++            linker_script_file.writeAll(linker_script_content) catch return LinkError.OutOfMemory;
++
++            // Use the linker script
++            try args.append("-T");
++            try args.append(linker_script_path);
++        },
+         else => {
+             // Generic ELF linker
+             try args.append("ld.lld");
+@@ -337,12 +421,12 @@ fn buildLinkArgs(ctx: *CliContext, config: LinkConfig) LinkError!std.array_list.
+         },
+     }
+ 
+-    // For WASM targets, wrap platform files in --whole-archive to include all symbols
+-    // This ensures host exports (init, handleEvent, update) aren't stripped even when
+-    // not referenced by other code
++    // For WASM and SBF targets, wrap platform files in --whole-archive to include all symbols
++    // This ensures host exports (init, handleEvent, update, entrypoint) aren't stripped
+     const is_wasm = config.target_format == .wasm;
++    const is_sbf = config.target_format == .sbf;
+     const is_macos = target_os == .macos;
+-    if (is_wasm and config.platform_files_pre.len > 0) {
++    if ((is_wasm or is_sbf) and config.platform_files_pre.len > 0) {
+         try args.append("--whole-archive");
+     }
+ 
+@@ -419,7 +503,7 @@ pub fn link(ctx: *CliContext, config: LinkConfig) LinkError!void {
+ 
+     // Call appropriate LLD function based on target format
+     const success = switch (config.target_format) {
+-        .elf => llvm_externs.ZigLLDLinkELF(
++        .elf, .sbf => llvm_externs.ZigLLDLinkELF(
+             @intCast(c_args.len),
+             c_args.ptr,
+             config.can_exit_early,
+diff --git a/src/cli/main.zig b/src/cli/main.zig
+index 9cbcd94eb9..1177380f62 100644
+--- a/src/cli/main.zig
++++ b/src/cli/main.zig
+@@ -125,6 +125,9 @@ const ShimLibraries = struct {
+     /// WebAssembly target shim (wasm32-freestanding)
+     const wasm32 = if (builtin.is_test) &[_]u8{} else @embedFile("targets/wasm32/libroc_interpreter_shim.a");
+ 
++    /// Solana SBF target shim (sbf-solana)
++    const sbfsolana = if (builtin.is_test) &[_]u8{} else @embedFile("targets/sbfsolana/libroc_interpreter_shim.a");
++
+     /// Get the appropriate shim library bytes for the given target
+     pub fn forTarget(target: roc_target.RocTarget) []const u8 {
+         return switch (target) {
+@@ -133,6 +136,7 @@ const ShimLibraries = struct {
+             .x64glibc => x64glibc,
+             .arm64glibc => arm64glibc,
+             .wasm32 => wasm32,
++            .sbfsolana => sbfsolana,
+             // Native/host targets use the native shim
+             .x64mac, .arm64mac, .x64win, .arm64win => native,
+             // Fallback for other targets (will use native, may not work for cross-compilation)
+diff --git a/src/cli/platform_host_shim.zig b/src/cli/platform_host_shim.zig
+index 0b52c5302b..b806a2ba35 100644
+--- a/src/cli/platform_host_shim.zig
++++ b/src/cli/platform_host_shim.zig
+@@ -219,7 +219,9 @@ fn addRocSerializedModule(builder: *Builder, target: RocTarget, serialized_modul
+         const array_var = try builder.addVariable(internal_name, str_const.typeOf(builder), .default);
+         try array_var.setInitializer(str_const, builder);
+         array_var.setLinkage(.internal, builder);
+-        array_var.setMutability(.global, builder);
++        // Use .constant mutability so data goes into .rodata instead of .data
++        // This is critical for Solana BPF which doesn't allow writable data sections
++        array_var.setMutability(.constant, builder);
+         array_var.setAlignment(Builder.Alignment.fromByteUnits(8), builder);
+ 
+         // Create the external base_ptr variable pointing to the internal array
+diff --git a/src/target/mod.zig b/src/target/mod.zig
+index 394f75de3a..9f2dbb9483 100644
+--- a/src/target/mod.zig
++++ b/src/target/mod.zig
+@@ -34,6 +34,9 @@ pub const RocTarget = enum {
+     // WebAssembly
+     wasm32,
+ 
++    // Solana BPF (SBF)
++    sbfsolana,
++
+     /// Parse target from string (e.g., "arm64mac", "x64musl")
+     pub fn fromString(str: []const u8) ?RocTarget {
+         const enum_info = @typeInfo(RocTarget);
+@@ -91,6 +94,7 @@ pub const RocTarget = enum {
+                 }
+             },
+             .wasm32 => return .wasm32,
++            .sbf => return .sbfsolana,
+             else => {
+                 // Default fallback based on OS
+                 switch (os) {
+@@ -123,6 +127,7 @@ pub const RocTarget = enum {
+             .x64netbsd => .netbsd,
+             .x64musl, .x64glibc, .x64linux, .x64elf, .arm64musl, .arm64glibc, .arm64linux, .arm32musl, .arm32linux => .linux,
+             .wasm32 => .freestanding,
++            .sbfsolana => .solana,
+         };
+     }
+ 
+@@ -140,6 +145,9 @@ pub const RocTarget = enum {
+ 
+             // WebAssembly
+             .wasm32 => .wasm32,
++
++            // Solana BPF
++            .sbfsolana => .sbf,
+         };
+     }
+ 
+@@ -170,6 +178,9 @@ pub const RocTarget = enum {
+ 
+             // WebAssembly
+             .wasm32 => "wasm32-unknown-unknown",
++
++            // Solana BPF
++            .sbfsolana => "sbf-solana-solana",
+         };
+     }
+ 
+@@ -184,7 +195,7 @@ pub const RocTarget = enum {
+     /// Check if target uses static linking (musl targets)
+     pub fn isStatic(self: RocTarget) bool {
+         return switch (self) {
+-            .x64musl, .arm64musl, .arm32musl => true,
++            .x64musl, .arm64musl, .arm32musl, .sbfsolana => true,
+             else => false,
+         };
+     }
+@@ -216,18 +227,18 @@ pub const RocTarget = enum {
+     /// Get the pointer bit width for this target
+     pub fn ptrBitWidth(self: RocTarget) u16 {
+         return switch (self.toCpuArch()) {
+-            .x86_64, .aarch64, .aarch64_be => 64,
++            .x86_64, .aarch64, .aarch64_be, .sbf => 64,
+             .arm, .wasm32 => 32,
+             else => 64, // Default to 64-bit
+         };
+     }
+ 
+     /// Check if this target can be built and run on the current host.
+-    /// wasm32 is always compatible (cross-compilation to wasm works on any host).
++    /// wasm32 and sbfsolana are always compatible (cross-compilation works on any host).
+     /// Native targets are compatible if both OS and architecture match the host.
+     pub fn isCompatibleWithHost(self: RocTarget) bool {
+-        // wasm32 can be built from any host
+-        if (self == .wasm32) return true;
++        // wasm32 and sbfsolana can be built from any host
++        if (self == .wasm32 or self == .sbfsolana) return true;
+ 
+         // Otherwise, check if both OS and architecture match
+         return self.toOsTag() == builtin.target.os.tag and
+@@ -265,6 +276,9 @@ pub const RocTarget = enum {
+ 
+             // WebAssembly doesn't use dynamic linker
+             .wasm32 => return error.WebAssemblyTarget,
++
++            // Solana BPF doesn't use dynamic linker
++            .sbfsolana => return error.SolanaBPFTarget,
+         };
+     }
+ };
+
+diff --git a/crates/compiler/builtins/bitcode/src/sbf_minimal.zig b/crates/compiler/builtins/bitcode/src/sbf_minimal.zig
+new file mode 100644
+--- /dev/null
++++ b/crates/compiler/builtins/bitcode/src/sbf_minimal.zig
+@@ -0,0 +1,84 @@
++//! Minimal SBF builtins for Roc on Solana
++//!
++//! These are stripped-down builtins that don't use any std lib features
++//! that are unavailable on Solana (threads, posix, file I/O, etc.)
++//!
++//! Most actual functionality is provided by the Zig host.
++
++const builtin = @import("builtin");
++
++// Verify we're compiling for SBF
++comptime {
++    if (builtin.cpu.arch != .sbf) {
++        @compileError("This file should only be compiled for SBF target");
++    }
++}
++
++// Use BPF calling convention for SBF
++const cc: std.builtin.CallingConvention = .{ .bpf_std = .{} };
++
++// ============================================================================
++// Memory operations - these are provided by the host, we just declare them
++// ============================================================================
++
++// Note: On Solana, memory allocation is handled by the host through
++// roc_alloc, roc_realloc, roc_dealloc which are provided by the Zig host.
++
++// ============================================================================
++// Basic numeric operations
++// ============================================================================
++
++export fn @"roc_builtins.num.add_i64"(a: i64, b: i64) callconv(cc) i64 {
++    return a +% b;
++}
++
++export fn @"roc_builtins.num.sub_i64"(a: i64, b: i64) callconv(cc) i64 {
++    return a -% b;
++}
++
++export fn @"roc_builtins.num.mul_i64"(a: i64, b: i64) callconv(cc) i64 {
++    return a *% b;
++}
++
++export fn @"roc_builtins.num.add_u64"(a: u64, b: u64) callconv(cc) u64 {
++    return a +% b;
++}
++
++export fn @"roc_builtins.num.sub_u64"(a: u64, b: u64) callconv(cc) u64 {
++    return a -% b;
++}
++
++export fn @"roc_builtins.num.mul_u64"(a: u64, b: u64) callconv(cc) u64 {
++    return a *% b;
++}
++
++// ============================================================================
++// Memory copy/set operations (inline implementations)
++// ============================================================================
++
++export fn @"roc_builtins.utils.memcpy"(dest: [*]u8, src: [*]const u8, len: usize) callconv(cc) [*]u8 {
++    var i: usize = 0;
++    while (i < len) : (i += 1) {
++        dest[i] = src[i];
++    }
++    return dest;
++}
++
++export fn @"roc_builtins.utils.memset"(dest: [*]u8, value: u8, len: usize) callconv(cc) [*]u8 {
++    var i: usize = 0;
++    while (i < len) : (i += 1) {
++        dest[i] = value;
++    }
++    return dest;
++}
++
++// ============================================================================
++// Placeholder stubs for string/list operations
++// These will be replaced or provided by the host
++// ============================================================================
++
++export fn @"roc_builtins.str.init"() callconv(cc) void {}
++export fn @"roc_builtins.list.init"() callconv(cc) void {}
++
++// Need std for CallingConvention type
++const std = @import("std");
+
+diff --git a/src/interpreter_shim/sbf_stub.zig b/src/interpreter_shim/sbf_stub.zig
+new file mode 100644
+--- /dev/null
++++ b/src/interpreter_shim/sbf_stub.zig
+@@ -0,0 +1,86 @@
++//! Minimal stub for SBF/Solana target
++//!
++//! Solana programs run compiled code, not interpreted.
++//! This file provides the minimal exports needed to satisfy the linker
++//! when building Roc applications for Solana.
++//!
++//! The platform shim calls roc_entrypoint which dispatches to the compiled Roc functions.
++
++const std = @import("std");
++
++// RocStr ABI - must match what the Roc compiler generates
++const RocStr = extern struct {
++    bytes: ?[*]const u8,
++    length: u32,
++    capacity: u32,
++
++    pub fn asSlice(self: *const RocStr) []const u8 {
++        if (self.bytes) |ptr| {
++            return ptr[0..@as(usize, self.length)];
++        }
++        return &[_]u8{};
++    }
++};
++
++// STUB: For now, provide a hardcoded implementation
++// TODO: Once Roc supports native SBF code generation, this should be:
++// extern fn roc__main_for_host_1_exposed_generic(output: *RocStr) callconv(.c) void;
++//
++// Currently Roc generates serialized IR for interpretation, not native code.
++// This stub allows testing the Solana pipeline while native codegen is being developed.
++//
++// NOTE: The message below is intentionally different from app.roc to distinguish
++// stub output from actual Roc-compiled code. When you see this message, it means
++// the stub is being used, not the actual Roc application code.
++const stub_message = "[STUB] Roc SBF pipeline works - awaiting native codegen";
++
++export fn roc__main_for_host_1_exposed_generic(output: *RocStr) callconv(.c) void {
++    output.* = RocStr{
++        .bytes = stub_message.ptr,
++        .length = @intCast(stub_message.len),
++        .capacity = @intCast(stub_message.len),
++    };
++}
++
++// External: Solana log syscall (provided by Solana runtime)
++extern fn sol_log_(message: [*]const u8, len: u64) callconv(.c) void;
++
++/// roc_entrypoint - Called by the platform shim to execute the Roc program
++/// This is the bridge between the platform shim and the compiled Roc code.
++///
++/// For Solana, we:
++/// 1. Call the Roc main function to get the string
++/// 2. Log it to the Solana program log
++export fn roc_entrypoint(
++    entry_idx: i32,
++    ops: ?*anyopaque,
++    ret_ptr: ?*anyopaque,
++    arg_ptr: ?*anyopaque,
++) callconv(.c) void {
++    // Ignore unused parameters (interpreter-style ABI)
++    _ = entry_idx;
++    _ = ops;
++    _ = ret_ptr;
++    _ = arg_ptr;
++
++    // Call the Roc main function
++    var result: RocStr = .{ .bytes = null, .length = 0, .capacity = 0 };
++    roc__main_for_host_1_exposed_generic(&result);
++
++    // Log the result to Solana
++    const slice = result.asSlice();
++    sol_log_(slice.ptr, slice.len);
++}
++
++// Minimal exports for SBF target - Solana programs don't use the interpreter
++export fn roc__mainForHost() void {
++    // Stub - actual main is provided by the compiled Roc application
++}
++
++// Roc memory functions - these will be provided by the platform host
++pub extern fn roc_alloc(size: usize, alignment: u32) ?[*]u8;
++pub extern fn roc_realloc(ptr: [*]u8, new_size: usize, old_size: usize, alignment: u32) ?[*]u8;
++pub extern fn roc_dealloc(ptr: [*]u8, alignment: u32) void;
++pub extern fn roc_panic(msg: [*]const u8, tag_id: u32) noreturn;
++
++// Minimal compiler-rt support is bundled via the build system
