@@ -1,11 +1,12 @@
 .{
     .name = .roc_on_solana,
-    .version = "0.1.0",
+    .version = "0.2.0",
     .minimum_zig_version = "0.15.0",
     .fingerprint = 0xf2ef55d2ec70ddd2,
     .dependencies = .{
         .solana_program_sdk = .{
-            .path = "vendor/solana-program-sdk-zig",
+            .url = "git+https://github.com/DaviRain-Su/solana-program-sdk-zig#main",
+            .hash = "solana_program_sdk-0.17.1-wGj9UOwMAQBjEGIMm8hzb3kVV0jR54brcqtNC9zkWfEH",
         },
         .base58 = .{
             .url = "https://github.com/joncinque/base58-zig/archive/refs/tags/v0.15.0.tar.gz",
@@ -17,8 +18,10 @@
         "build.zig.zon",
         "src",
         "platform",
-        "examples",
-        "LICENSE",
+        "test-roc",
+        "scripts",
+        "docs",
+        "stories",
         "README.md",
     },
 }
