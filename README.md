@@ -2,81 +2,143 @@
 
 使用 Roc 函数式编程语言在 Solana 区块链上编写智能合约。
 
+## 快速开始
+
+```bash
+# 1. 克隆项目
+git clone https://github.com/YourRepo/solana-sdk-roc.git
+cd solana-sdk-roc
+
+# 2. 一键安装工具链
+./install.sh
+
+# 3. 编译 Roc 程序
+./roc-solana build test-roc/fib_dynamic.roc
+
+# 4. 部署到本地测试网
+solana-test-validator  # 另一个终端
+./roc-solana deploy
+
+# 5. 测试
+./roc-solana test
+```
+
 ## 项目状态
 
-**当前版本**: v0.2.0 ✅ (核心功能完成)
-
-### 已验证功能
+**当前版本**: v0.2.0 ✅
 
 | 功能 | 状态 | 计算单元 |
 |------|------|----------|
 | Hello World | ✅ | ~127 CU |
 | 递归 Fibonacci(15) | ✅ | ~20,842 CU |
 | 迭代 Fibonacci(50) | ✅ | ~831 CU |
-| **字符串插值** | ✅ | ~2,339 CU |
+| 字符串插值 | ✅ | ~2,339 CU |
 
-### 示例输出
+## 安装选项
 
-```
-Program log: Fib(10) = 55
-Program consumed 2339 of 200000 compute units
-Program success
-```
-
-## 快速开始
-
-### 前置条件
-
-详细安装指南见 [docs/roc-build-guide.md](docs/roc-build-guide.md)
+### 完整安装 (推荐)
 
 ```bash
-# 1. LLVM 18
-sudo apt install llvm-18 llvm-18-dev
-
-# 2. Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# 3. Solana CLI
-sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
-
-# 4. solana-zig (已包含或下载)
-wget https://github.com/joncinque/solana-zig-bootstrap/releases/download/solana-v1.52.0/zig-x86_64-linux-musl.tar.bz2
-tar -xjf zig-x86_64-linux-musl.tar.bz2 && mv zig-x86_64-linux-musl solana-zig
+./install.sh
 ```
 
-### 编译 Roc 编译器
+自动安装:
+- solana-zig (Zig 0.15.2 + SBF 支持)
+- Roc 编译器 (带 SBF 补丁)
+- Node.js 依赖
+
+### 快速安装 (仅下载工具链)
 
 ```bash
-cd roc-source
-git apply ../docs/roc-sbf-complete.patch
-LLVM_SYS_180_PREFIX=/usr/lib/llvm-18 cargo build --release --features target-bpf -p roc_cli
+./install.sh --quick
+# 稍后编译 Roc:
+./install.sh --roc-only
 ```
 
-### 构建和部署
+### 手动安装
+
+参见 [docs/roc-build-guide.md](docs/roc-build-guide.md)
+
+## 使用方法
+
+### roc-solana 命令
 
 ```bash
-# 编译 Roc 程序
-./solana-zig/zig build roc -Droc-app=test-roc/fib_dynamic.roc
+./roc-solana build [app.roc]  # 编译 Roc 应用
+./roc-solana deploy           # 部署到 Solana
+./roc-solana test             # 调用程序
+./roc-solana clean            # 清理缓存
+```
 
-# 启动本地验证器 (另一个终端)
-solana-test-validator
+### 直接使用 zig build
 
-# 部署
-solana config set --url localhost
-solana airdrop 2
-solana program deploy zig-out/lib/roc-hello.so
+```bash
+# 编译
+./solana-zig/zig build roc -Droc-app=your-app.roc
 
 # 测试
-node scripts/call-program.mjs
+./solana-zig/zig build test
 ```
+
+## 编写 Roc 程序
+
+创建新的 Roc 应用:
+
+```roc
+# my-app.roc
+app [main] { pf: platform "platform/main.roc" }
+
+main : Str
+main = "Hello from Roc on Solana!"
+```
+
+编译并部署:
+
+```bash
+./roc-solana build my-app.roc
+./roc-solana deploy
+./roc-solana test
+```
+
+## 项目结构
+
+```
+solana-sdk-roc/
+├── install.sh           # 一键安装脚本
+├── roc-solana           # 便捷命令工具
+├── build.zig            # 构建配置
+├── platform/            # Roc 平台定义
+│   ├── main.roc
+│   └── targets/
+├── src/host.zig         # Solana 宿主代码
+├── test-roc/            # 示例程序
+│   └── fib_dynamic.roc
+├── scripts/
+│   └── call-program.mjs # 测试脚本
+├── docs/
+│   ├── roc-build-guide.md
+│   ├── roc-sbf-complete.patch
+│   └── ...
+├── solana-zig/          # (安装后) Zig + SBF
+└── roc-source/          # (安装后) Roc 编译器
+```
+
+## 前置要求
+
+| 依赖 | 版本 | 安装命令 |
+|------|------|----------|
+| LLVM | 18.x | `sudo apt install llvm-18 llvm-18-dev` |
+| Rust | latest | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
+| Solana CLI | 2.0+ | `sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"` |
+| Node.js | 18+ | `sudo apt install nodejs npm` |
 
 ## 架构
 
 ```
 Roc 源码 (.roc)
     │
-    ▼ [Roc 编译器 (修改版)]
-LLVM Bitcode
+    ▼ [Roc 编译器 + SBF 补丁]
+LLVM Bitcode (.bc)
     │
     ▼ [solana-zig]
 Solana SBF 程序 (.so)
@@ -85,64 +147,41 @@ Solana SBF 程序 (.so)
 链上程序
 ```
 
-## 项目结构
-
-```
-solana-sdk-roc/
-├── solana-zig/          # Zig 0.15.2 + SBF 支持
-├── roc-source/          # Roc 编译器 (需要打补丁)
-├── src/host.zig         # Solana 宿主代码
-├── test-roc/            # 测试程序
-├── docs/
-│   ├── journey-from-zero-to-success.md  # 完整历程
-│   ├── roc-build-guide.md               # 编译指南
-│   ├── roc-sbf-complete.md              # 修改说明
-│   └── roc-sbf-complete.patch           # 补丁文件
-└── build.zig
-```
-
 ## 文档
 
 | 文档 | 说明 |
 |------|------|
-| [journey-from-zero-to-success.md](docs/journey-from-zero-to-success.md) | 从零到成功的完整历程 |
 | [roc-build-guide.md](docs/roc-build-guide.md) | 完整编译指南 |
+| [journey-from-zero-to-success.md](docs/journey-from-zero-to-success.md) | 开发历程 |
 | [roc-sbf-complete.md](docs/roc-sbf-complete.md) | Roc 修改详解 |
 | [architecture.md](docs/architecture.md) | 架构说明 |
 
-## 示例代码
+## 常见问题
 
-**test-roc/fib_dynamic.roc**:
-```roc
-app [main] { pf: platform "platform/main.roc" }
+### 编译错误: `enum 'Target.Cpu.Arch' has no member named 'sbf'`
 
-main : Str
-main =
-    n = 10
-    result = fib n
-    "Fib(10) = $(Num.to_str result)"
+必须使用 `./solana-zig/zig` 而不是系统 zig:
 
-fib : U64 -> U64
-fib = \num ->
-    if num <= 1 then num
-    else fib (num - 1) + fib (num - 2)
+```bash
+# ❌ 错误
+zig build
+
+# ✅ 正确
+./solana-zig/zig build
 ```
 
-## 技术栈
+### Roc 编译器找不到
 
-| 组件 | 版本 | 用途 |
-|------|------|------|
-| Roc | 开发版 + 补丁 | 函数式编程语言 |
-| LLVM | 18.x | 编译器后端 |
-| solana-zig | 0.15.2 | SBF 目标编译 |
-| Solana CLI | 2.0+ | 部署测试 |
+运行 `./install.sh --roc-only` 重新编译 Roc。
 
-## 未来计划
+### 部署失败
 
-- [ ] 账户读取支持
-- [ ] 指令数据解析
-- [ ] CPI (跨程序调用)
-- [ ] SPL Token 集成
+确保本地验证器运行中:
+```bash
+solana-test-validator
+solana config set --url localhost
+solana airdrop 2
+```
 
 ## 相关资源
 

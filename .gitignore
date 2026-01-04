@@ -11,20 +11,21 @@ zig-out
 program-keypair*
 test-ledger
 
-# Dependencies (fetched automatically by zig build)
-.zig-cache/p
-
-# Toolchains (download separately)
+# Toolchains (installed by install.sh)
 solana-zig
 roc-source
-roc_nightly-*
+roc-sbf
 
-# Archives (not needed after extraction)
+# Generated command
+roc-solana
+
+# Archives
 *.tar.bz2
 *.tar.xz
 *.tar.gz
+roc_nightly-*
 
-# Old/removed directories
+# Old directories (cleanup)
 solana-platform-*
 platform-tools*
 solana-rust
@@ -32,6 +33,7 @@ solana-llvm
 solana-zig-bootstrap
 llvm-*
 zig-x86_64-linux-*
+vendor
 
 # Node.js
 node_modules
