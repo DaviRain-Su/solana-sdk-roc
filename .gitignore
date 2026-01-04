@@ -1,18 +1,41 @@
+# Build artifacts
 .zig-cache
 zig-out
-.program-id
-vendor
-roc_nightly-*
-zig-x86_64-linux-*
-program-keypair*
-solana-zig
-solana-platform-*
-platform-*
-solana-rust
-solana-llvm
-llvm-*
-node_modules
 *.so
 *.ld
-solana-zig-*
+*.o
+*.bc
+
+# Solana
+.program-id
+program-keypair*
 test-ledger
+
+# Dependencies (fetch with build.zig.zon)
+vendor
+
+# Toolchains (download separately)
+solana-zig
+roc-source
+roc_nightly-*
+
+# Archives (not needed after extraction)
+*.tar.bz2
+*.tar.xz
+*.tar.gz
+
+# Old/removed directories
+solana-platform-*
+platform-tools*
+solana-rust
+solana-llvm
+solana-zig-bootstrap
+llvm-*
+zig-x86_64-linux-*
+
+# Node.js
+node_modules
+
+# IDE
+.vscode
+.idea
