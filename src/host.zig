@@ -4,8 +4,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+// SBF detection: solana-zig uses .sbf arch with .solana OS
+const is_sbf = builtin.cpu.arch == .sbf and builtin.os.tag == .solana;
 const is_bpf = builtin.cpu.arch == .bpfel and builtin.os.tag == .freestanding;
 const is_test = builtin.is_test;
+const is_solana = is_sbf or is_bpf;
 
 const sdk = @import("solana_program_sdk");
 const sdk_allocator = sdk.allocator;
@@ -79,13 +82,15 @@ fn getTestAllocator() std.mem.Allocator {
 }
 
 export fn roc_alloc(size: usize, alignment: u32) callconv(.c) ?*anyopaque {
-    if (is_test) {
-        const alloc = getTestAllocator();
+    if (is_solana) {
+        // In Solana mode, use SDK allocator
+        const alloc = sdk_allocator.allocator;
         const align_val = std.mem.Alignment.fromByteUnits(alignment);
         const result = alloc.rawAlloc(size, align_val, @returnAddress());
         return if (result) |ptr| @ptrCast(ptr) else null;
     } else {
-        const alloc = sdk_allocator.allocator;
+        // In test mode, use page allocator
+        const alloc = getTestAllocator();
         const align_val = std.mem.Alignment.fromByteUnits(alignment);
         const result = alloc.rawAlloc(size, align_val, @returnAddress());
         return if (result) |ptr| @ptrCast(ptr) else null;
@@ -135,7 +140,8 @@ export fn entrypoint(input: [*]u8) callconv(.c) u64 {
     // Call Roc's main function
     var roc_result: RocStr = RocStr.empty();
 
-    if (is_bpf) {
+    if (is_solana) {
+        // In Solana mode (SBF or BPF), call the Roc function (extern or embedded)
         // In BPF mode, call the Roc function (extern or embedded)
         roc_fns.roc__main_for_host_1_exposed_generic(&roc_result);
         sdk_log.log(roc_result.asSlice());
