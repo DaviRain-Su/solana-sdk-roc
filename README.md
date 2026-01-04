@@ -4,13 +4,23 @@
 
 ## 项目状态
 
-**当前版本**: v0.1.0 ✅
+**当前版本**: v0.2.0 🔨 (进行中)
 
+### v0.1.0 (已完成)
 - ✅ Zig 宿主实现 (使用 solana-program-sdk-zig)
 - ✅ SBF 字节码生成和链接 (使用 solana-zig-bootstrap)
 - ✅ 部署到本地测试网
 - ✅ 程序成功调用并输出日志
-- ⏳ Roc 语言集成
+
+### v0.2.0 (进行中 - 50% 完成)
+- ✅ Solana LLVM 完整编译 (2GB, 208 个库)
+- ✅ Roc 编译器使用 solana-zig 重新编译
+- ✅ 修复 LLVM 三元组配置 (sbf-solana-solana)
+- ✅ 验证 Roc 基本编译功能
+- ✅ 创建 Roc 平台定义和应用示例
+- 🔨 LLVM 编译链集成 (位码 → SBF 目标代码)
+- 🔨 Zig 宿主链接
+- ⏳ 部署和功能验证
 
 ## 快速开始
 
@@ -155,13 +165,55 @@ roc-on-solana/
 - `sdk.log.log()` - Solana 日志输出
 - `sdk.syscalls` - Solana 系统调用
 
-## 下一步计划 (v0.2.0)
+## v0.2.0 实施进度
 
-- [ ] 使用 solana-zig 重新编译 Roc 编译器
-- [ ] 集成 Roc 编译器 LLVM 输出
+参考: `IMPLEMENTATION_STATUS.md` 了解详细状态
+
+### 当前工作流程
+
+```
+examples/hello-world/app.roc
+    ↓ ./roc-source/zig-out/bin/roc build --emit-llvm-bc
+zig-out/lib/app.bc (LLVM 位码)
+    ↓ solana-rust/.../llc -march=sbf
+zig-out/lib/app.o (SBF 目标文件)
+    ↓ ./solana-zig/zig build (链接)
+zig-out/lib/roc-hello.so (最终程序)
+    ↓ solana program deploy
+链上程序
+```
+
+### 测试
+
+参考: `TESTING_GUIDE.md` 了解完整的测试程序
+
+```bash
+# 1. 验证 Roc 编译
+./roc-source/zig-out/bin/roc check examples/hello-world/app.roc
+
+# 2. 生成位码
+./roc-source/zig-out/bin/roc build --target sbfsolana --emit-llvm-bc examples/hello-world/app.roc -o zig-out/lib/app.bc
+
+# 3. 使用 Solana LLVM 编译
+export LLVM_PATH=solana-rust/build/x86_64-unknown-linux-gnu/llvm/build
+$LLVM_PATH/bin/llc -march=sbf -filetype=obj -o zig-out/lib/app.o zig-out/lib/app.bc
+
+# 4. 构建最终程序
+./solana-zig/zig build
+```
+
+## 下一步计划
+
+### v0.2.0 后期
+- [ ] 完成 LLVM 编译链集成
+- [ ] 部署到本地测试网并验证
+- [ ] 优化编译时间和程序大小
+
+### v0.3.0
 - [ ] 实现 Roc 效果到 Solana syscalls 映射
 - [ ] 支持账户操作和 CPI
 - [ ] 完整的 Roc 程序示例
+- [ ] 文档和教程
 
 ## 相关资源
 

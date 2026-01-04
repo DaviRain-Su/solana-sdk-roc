@@ -9,3 +9,5 @@ solana-zig
 solana-platform-*
 platform-*
 solana-rust
+solana-llvm
+llvm-*
