@@ -1,15 +1,5 @@
-//! Solana Host Implementation for Roc Programs
-//!
-//! This module bridges Roc programs to the Solana runtime by:
-//! 1. Providing Roc runtime functions (roc_alloc, roc_panic, etc.)
-//! 2. Using solana-program-sdk-zig for allocator and logging
-//! 3. Defining the entrypoint that calls Roc's main function
-//!
-//! v0.2.0: Added real Roc integration - host now calls Roc's main_for_host
-//!
-//! Build modes:
-//! - use_external_roc = true: Link with Roc-compiled object file
-//! - use_external_roc = false: Use embedded Zig implementation
+//! Solana Host for Roc Programs
+//! Provides the entrypoint, memory management, and syscalls for Solana programs
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -17,7 +7,7 @@ const builtin = @import("builtin");
 const is_bpf = builtin.cpu.arch == .bpfel and builtin.os.tag == .freestanding;
 const is_test = builtin.is_test;
 
-const sdk = @import("solana_sdk");
+const sdk = @import("solana_program_sdk");
 const sdk_allocator = sdk.allocator;
 const sdk_log = sdk.log;
 
