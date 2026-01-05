@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const version = "0.1.0";
+const version = "0.2.0";
 
 const Config = struct {
     roc_sbf_version: []const u8 = "sbf-v0.1.0",

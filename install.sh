@@ -5,7 +5,7 @@
 set -e
 
 REPO="DaviRain-Su/solana-sdk-roc"
-CLI_VERSION="0.1.0"
+CLI_VERSION="0.2.0"
 INSTALL_DIR="${HOME}/.local/bin"
 
 # Colors (using printf for POSIX compatibility)
