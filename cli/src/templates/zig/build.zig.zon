@@ -1,0 +1,13 @@
+.{
+    .name = .my_solana_program,
+    .version = "0.1.0",
+    .fingerprint = 0x748686f984e102d1,
+    .minimum_zig_version = "0.15.0",
+    .dependencies = .{
+        .solana_program_sdk = .{
+            .url = "https://github.com/DaviRain-Su/solana-program-sdk-zig/archive/refs/tags/v0.17.1.tar.gz",
+            .hash = "solana_program_sdk-0.17.1-wGj9UJOCBAAxPrWl-Nt5DGxwrfXkq__twFRQmwt_TWJt",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

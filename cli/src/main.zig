@@ -49,24 +49,25 @@ pub fn main() !void {
 
 fn printUsage() void {
     const usage =
-        \\roc-solana - Compile Roc programs for Solana
+        \\roc-solana - Build Solana programs with Roc or Zig
         \\
         \\Usage: roc-solana <command> [options]
         \\
         \\Commands:
-        \\  init <name>           Create a new Roc Solana project
-        \\  build [app.roc]       Compile Roc app to Solana program (.so)
+        \\  init <name>           Create a new Roc Solana project (default)
+        \\  init <name> --zig     Create a new Zig Solana project
+        \\  build [app.roc]       Compile to Solana program (.so)
         \\  deploy                Deploy to Solana network
         \\  test                  Call the deployed program
-        \\  toolchain install     Install all dependencies (bun, solana, roc, zig)
+        \\  toolchain install     Install all dependencies
         \\  toolchain info        Show installed versions
         \\  version               Show version info
         \\  help                  Show this help
         \\
         \\Examples:
-        \\  roc-solana toolchain install   # First time setup
-        \\  roc-solana init my-program
-        \\  cd my-program
+        \\  roc-solana init my-roc-app           # Roc project
+        \\  roc-solana init my-zig-app --zig     # Zig project
+        \\  cd my-app
         \\  roc-solana build
         \\  roc-solana deploy
         \\  roc-solana test
@@ -83,9 +84,20 @@ fn printVersion() void {
 
 fn cmdInit(allocator: std.mem.Allocator, args: []const []const u8) !void {
     _ = allocator;
-    const name = if (args.len > 0) args[0] else "my-solana-app";
 
-    std.debug.print("Creating project: {s}\n", .{name});
+    var name: []const u8 = "my-solana-app";
+    var use_zig = false;
+
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--zig")) {
+            use_zig = true;
+        } else if (arg[0] != '-') {
+            name = arg;
+        }
+    }
+
+    const project_type = if (use_zig) "Zig" else "Roc";
+    std.debug.print("Creating {s} project: {s}\n", .{ project_type, name });
 
     std.fs.cwd().makeDir(name) catch |err| {
         if (err != error.PathAlreadyExists) return err;
@@ -94,22 +106,34 @@ fn cmdInit(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var dir = try std.fs.cwd().openDir(name, .{});
     defer dir.close();
 
-    const app_main_roc = @embedFile("templates/main.roc");
-    const platform_roc = @embedFile("templates/platform.roc");
-    const host_roc = @embedFile("templates/Host.roc");
-    const host_zig = @embedFile("templates/host.zig");
-    const build_zig = @embedFile("templates/build.zig");
-    const build_zon = @embedFile("templates/build.zig.zon");
-    const package_json = @embedFile("templates/package.json");
-    const test_mjs = @embedFile("templates/test.mjs");
+    const package_json = @embedFile("templates/scripts/package.json");
+    const test_mjs = @embedFile("templates/scripts/test.mjs");
     const gitignore = @embedFile("templates/gitignore");
 
-    try writeFile(dir, "app/main.roc", app_main_roc);
-    try writeFile(dir, "platform/main.roc", platform_roc);
-    try writeFile(dir, "platform/Host.roc", host_roc);
-    try writeFile(dir, "platform/host/main.zig", host_zig);
-    try writeFile(dir, "build.zig", build_zig);
-    try writeFile(dir, "build.zig.zon", build_zon);
+    if (use_zig) {
+        const zig_main = @embedFile("templates/zig/main.zig");
+        const zig_build = @embedFile("templates/zig/build.zig");
+        const zig_build_zon = @embedFile("templates/zig/build.zig.zon");
+
+        try writeFile(dir, "src/main.zig", zig_main);
+        try writeFile(dir, "build.zig", zig_build);
+        try writeFile(dir, "build.zig.zon", zig_build_zon);
+    } else {
+        const app_main_roc = @embedFile("templates/roc/main.roc");
+        const platform_roc = @embedFile("templates/roc/platform.roc");
+        const host_roc = @embedFile("templates/roc/Host.roc");
+        const host_zig = @embedFile("templates/roc/host.zig");
+        const build_zig = @embedFile("templates/roc/build.zig");
+        const build_zon = @embedFile("templates/roc/build.zig.zon");
+
+        try writeFile(dir, "app/main.roc", app_main_roc);
+        try writeFile(dir, "platform/main.roc", platform_roc);
+        try writeFile(dir, "platform/Host.roc", host_roc);
+        try writeFile(dir, "platform/host/main.zig", host_zig);
+        try writeFile(dir, "build.zig", build_zig);
+        try writeFile(dir, "build.zig.zon", build_zon);
+    }
+
     try writeFile(dir, "package.json", package_json);
     try writeFile(dir, "scripts/test.mjs", test_mjs);
     try writeFile(dir, ".gitignore", gitignore);
@@ -122,18 +146,51 @@ fn cmdInit(allocator: std.mem.Allocator, args: []const []const u8) !void {
 }
 
 fn cmdBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    const is_roc_project = blk: {
+        std.fs.cwd().access("app/main.roc", .{}) catch break :blk false;
+        break :blk true;
+    };
+
+    if (is_roc_project) {
+        try cmdBuildRoc(allocator, args);
+    } else {
+        try cmdBuildZig(allocator);
+    }
+}
+
+fn cmdBuildZig(allocator: std.mem.Allocator) !void {
+    std.debug.print("Building Zig project...\n", .{});
+
+    const toolchain = try ensureToolchain(allocator);
+
+    std.debug.print("  [1/1] Compiling Solana program...\n", .{});
+    const zig_result = try runProcess(allocator, &.{
+        toolchain.zig_path,
+        "build",
+    });
+
+    if (zig_result.term.Exited != 0) {
+        std.debug.print("Zig build failed\n", .{});
+        if (zig_result.stderr.len > 0) {
+            std.debug.print("{s}\n", .{zig_result.stderr});
+        }
+        return error.ZigBuildFailed;
+    }
+
+    std.debug.print("✓ Build complete: zig-out/lib/program.so\n", .{});
+}
+
+fn cmdBuildRoc(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const app_file = if (args.len > 0) args[0] else "app/main.roc";
 
     std.debug.print("Building: {s}\n", .{app_file});
 
     const toolchain = try ensureToolchain(allocator);
 
-    // Ensure .roc-solana directory exists
     std.fs.cwd().makeDir(".roc-solana") catch |err| {
         if (err != error.PathAlreadyExists) return err;
     };
 
-    // Step 1: Compile Roc to LLVM bitcode
     std.debug.print("  [1/2] Compiling Roc...\n", .{});
     const roc_result = try runProcess(allocator, &.{
         toolchain.roc_path,
@@ -146,14 +203,11 @@ fn cmdBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
         app_file,
     });
 
-    // Check if roc build succeeded by looking for output file
-    // Roc outputs to ".roc-solana/app" (without .o extension)
     const roc_output_exists = blk: {
         std.fs.cwd().access(".roc-solana/app", .{}) catch break :blk false;
         break :blk true;
     };
 
-    // Print Roc output (warnings, errors, etc.)
     if (roc_result.stderr.len > 0) {
         std.debug.print("{s}", .{roc_result.stderr});
     }
@@ -163,13 +217,11 @@ fn cmdBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
         return error.RocCompilationFailed;
     }
 
-    // Rename to .o for zig build
     std.fs.cwd().rename(".roc-solana/app", ".roc-solana/app.o") catch |err| {
         std.debug.print("Failed to rename roc output: {}\n", .{err});
         return error.RocCompilationFailed;
     };
 
-    // Step 2: Build with Zig, passing roc object file
     std.debug.print("  [2/2] Building Solana program...\n", .{});
     const zig_result = try runProcess(allocator, &.{
         toolchain.zig_path,
