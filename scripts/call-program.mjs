@@ -53,27 +53,49 @@ async function main() {
     const balance = await connection.getBalance(payer.publicKey);
     console.log(`Balance: ${balance / 1e9} SOL\n`);
     
-    // Create instruction to invoke our program
-    // Our program doesn't require any accounts or data - it just logs "Hello"
-    const instruction = new TransactionInstruction({
-        keys: [],
+    // Create a dedicated counter account owned by the program.
+    // Layout: first 8 bytes little-endian u64 counter.
+    const counter = Keypair.generate();
+    const counterSpace = 8;
+
+    const rentExemptLamports = await connection.getMinimumBalanceForRentExemption(counterSpace);
+
+    const createCounterIx = (await import('@solana/web3.js')).SystemProgram.createAccount({
+        fromPubkey: payer.publicKey,
+        newAccountPubkey: counter.publicKey,
+        lamports: rentExemptLamports,
+        space: counterSpace,
         programId,
-        data: Buffer.from([]),
+    });
+
+    // Instruction data:
+    // [0] init, [1] inc, [2 + u64] add
+    const initIx = new TransactionInstruction({
+        keys: [{ pubkey: counter.publicKey, isSigner: false, isWritable: true }],
+        programId,
+        data: Buffer.from([0]),
+    });
+
+    const incIx = new TransactionInstruction({
+        keys: [{ pubkey: counter.publicKey, isSigner: false, isWritable: true }],
+        programId,
+        data: Buffer.from([1]),
     });
     
     // Create and send transaction
     console.log('Sending transaction...\n');
-    
-    const transaction = new Transaction().add(instruction);
-    
+
+    const transaction = new Transaction().add(createCounterIx, initIx, incIx, incIx);
+
     try {
         const signature = await sendAndConfirmTransaction(
             connection,
             transaction,
-            [payer],
+            [payer, counter],
             { commitment: 'confirmed' }
         );
         
+        console.log(`Counter account: ${counter.publicKey.toBase58()}`);
         console.log(`Transaction signature: ${signature}\n`);
         
         // Fetch transaction logs

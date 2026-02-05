@@ -13,6 +13,7 @@ const sdk = @import("solana_program_sdk");
 const sdk_allocator = sdk.allocator;
 const sdk_log = sdk.log;
 
+
 // Roc functions provided by external object file (roc_app.o)
 // Only declared when not testing (tests don't link with roc_app.o)
 const roc__mainForHost_1_exposed_generic = if (is_test)
@@ -70,20 +71,78 @@ pub const RocStr = extern struct {
 };
 
 // ============================================
-// Solana Program Entrypoint
+// Solana Program Entrypoint + Instruction Handler
 // ============================================
 
-pub export fn entrypoint(_: [*]u8) callconv(.c) u64 {
-    // Call Roc's main function to get the string to log
-    var result: RocStr = .{ .first_8_bytes = 0, .second_8_bytes = 0, .third_8_bytes = 0 };
-    roc__mainForHost_1_exposed_generic(&result);
+const ProgramResult = sdk.ProgramResult;
+const ProgramError = sdk.ProgramError;
 
-    // Log the result using Small String Optimization aware decoding
-    const slice = result.asSlice();
-    sdk_log.log(slice);
+fn processInstruction(program_id: *sdk.PublicKey, accounts: []sdk.Account, data: []const u8) ProgramResult {
+    // Keep the Roc "main" demo behavior as a log prefix.
+    var prefix: RocStr = .{ .first_8_bytes = 0, .second_8_bytes = 0, .third_8_bytes = 0 };
+    roc__mainForHost_1_exposed_generic(&prefix);
 
-    // Return success
-    return 0;
+    // Minimal stateful contract (Phase A): a counter stored in accounts[0].data[0..8]
+    // Instruction format:
+    // - [] or [0]        => init (set counter=0)
+    // - [1]              => increment by 1
+    // - [2, <u64-le>]    => add amount
+    if (accounts.len < 1) {
+        sdk_log.log("Missing counter account");
+        return .{ .err = ProgramError.custom(1) };
+    }
+
+    const counter = accounts[0];
+    if (!counter.isWritable()) {
+        sdk_log.log("Counter must be writable");
+        return .{ .err = ProgramError.custom(2) };
+    }
+
+    // Require account owner == this program (fail closed)
+    if (!counter.ownerId().equals(program_id.*)) {
+        sdk_log.log("Counter account not owned by program");
+        return .{ .err = ProgramError.custom(3) };
+    }
+
+    // Ensure at least 8 bytes for state
+    if (counter.dataLen() < 8) {
+        // realloc is allowed only within padding rules; for MVP just fail with a clear message.
+        sdk_log.log("Counter account data too small (need >= 8 bytes)");
+        return .{ .err = ProgramError.custom(4) };
+    }
+
+    var buf = counter.data();
+    var current: u64 = std.mem.readInt(u64, buf[0..8], .little);
+
+    const tag: u8 = if (data.len >= 1) data[0] else 0;
+
+    if (tag == 0) {
+        current = 0;
+    } else if (tag == 1) {
+        current +%= 1;
+    } else if (tag == 2) {
+        if (data.len < 9) {
+            sdk_log.log("Add requires 8-byte amount");
+            return .{ .err = ProgramError.custom(5) };
+        }
+        const add_amt: u64 = std.mem.readInt(u64, data[1..9], .little);
+        current +%= add_amt;
+    } else {
+        sdk_log.log("Unknown instruction tag");
+        return .{ .err = ProgramError.custom(6) };
+    }
+
+    std.mem.writeInt(u64, buf[0..8], current, .little);
+
+    // Log: prefix + value
+    sdk_log.print("{s} counter={d}", .{ prefix.asSlice(), current });
+
+    return .ok;
+}
+
+comptime {
+    // Use the SDK's entrypoint loader to decode accounts+data safely.
+    sdk.entrypoint(processInstruction);
 }
 
 // ============================================

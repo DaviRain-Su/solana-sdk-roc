@@ -55,49 +55,60 @@ pub fn build(b: *std.Build) void {
     // 完整 Roc 编译流程 (使用修改后的 Roc 编译器)
     // ============================================
 
-    // Step 1: 调用 Roc 编译器生成 SBF LLVM bitcode
-    const roc_build_step = b.addSystemCommand(&.{
-        roc_compiler,
-        "build",
-        "--target",
-        "sbf",
-        "--no-link",
-    });
-    roc_build_step.addArg(roc_app);
-    roc_build_step.setName("roc-compile-sbf");
+    const with_roc = b.option(bool, "with-roc", "Run Roc compiler to rebuild roc_app.o") orelse false;
 
-    // Step 2: 复制 .o (bitcode) 为 .bc 以便 zig 识别
-    const copy_bc_step = b.addSystemCommand(&.{
-        "cp",
-    });
+    const roc_available = blk: {
+        // If roc_compiler doesn't exist, skip Roc compilation pipeline.
+        std.fs.cwd().access(roc_compiler, .{}) catch break :blk false;
+        break :blk true;
+    };
 
-    // 从 roc_app 路径推导输出文件名
-    // 例如: test-roc/simple.roc -> test-roc/simple.o -> test-roc/simple.bc
-    const app_base = std.fs.path.stem(roc_app);
-    const app_dir = std.fs.path.dirname(roc_app) orelse ".";
-    const roc_output_o = b.fmt("{s}/{s}.o", .{ app_dir, app_base });
-    const roc_output_bc = b.fmt("{s}/{s}.bc", .{ app_dir, app_base });
+    // Optional: full Roc compilation pipeline (Roc -> LLVM bitcode -> SBF object)
+    const compile_bc_step = if (with_roc and roc_available) blk: {
+        // Step 1: 调用 Roc 编译器生成 SBF LLVM bitcode
+        const roc_build_step = b.addSystemCommand(&.{
+            roc_compiler,
+            "build",
+            "--target",
+            "sbf",
+            "--no-link",
+        });
+        roc_build_step.addArg(roc_app);
+        roc_build_step.setName("roc-compile-sbf");
 
-    copy_bc_step.addArg(roc_output_o);
-    copy_bc_step.addArg(roc_output_bc);
-    copy_bc_step.step.dependOn(&roc_build_step.step);
-    copy_bc_step.setName("copy-to-bc");
+        // Step 2: 复制 .o (bitcode) 为 .bc 以便 zig 识别
+        const copy_bc_step = b.addSystemCommand(&.{ "cp" });
 
-    // Step 3: 使用 solana-zig 将 bitcode 编译为 SBF object
-    const compile_bc_step = b.addSystemCommand(&.{
-        "./solana-zig/zig",
-        "build-obj",
-    });
-    compile_bc_step.addArg(roc_output_bc);
-    compile_bc_step.addArgs(&.{
-        "-target",
-        "sbf-solana",
-        "-O",
-        "ReleaseSmall",
-        "-femit-bin=roc_app.o",
-    });
-    compile_bc_step.step.dependOn(&copy_bc_step.step);
-    compile_bc_step.setName("compile-bc-to-sbf");
+        // 从 roc_app 路径推导输出文件名
+        // 例如: test-roc/simple.roc -> test-roc/simple.o -> test-roc/simple.bc
+        const app_base = std.fs.path.stem(roc_app);
+        const app_dir = std.fs.path.dirname(roc_app) orelse ".";
+        const roc_output_o = b.fmt("{s}/{s}.o", .{ app_dir, app_base });
+        const roc_output_bc = b.fmt("{s}/{s}.bc", .{ app_dir, app_base });
+
+        copy_bc_step.addArg(roc_output_o);
+        copy_bc_step.addArg(roc_output_bc);
+        copy_bc_step.step.dependOn(&roc_build_step.step);
+        copy_bc_step.setName("copy-to-bc");
+
+        // Step 3: 使用 solana-zig 将 bitcode 编译为 SBF object
+        const compile_step = b.addSystemCommand(&.{
+            "./solana-zig/zig",
+            "build-obj",
+        });
+        compile_step.addArg(roc_output_bc);
+        compile_step.addArgs(&.{
+            "-target",
+            "sbf-solana",
+            "-O",
+            "ReleaseSmall",
+            "-femit-bin=roc_app.o",
+        });
+        compile_step.step.dependOn(&copy_bc_step.step);
+        compile_step.setName("compile-bc-to-sbf");
+
+        break :blk compile_step;
+    } else null;
 
     // ============================================
     // Solana SBF 构建
@@ -105,8 +116,10 @@ pub fn build(b: *std.Build) void {
 
     const build_result = buildSolanaProgram(b);
 
-    // 完整 Roc 流程步骤
-    build_result.lib.step.dependOn(&compile_bc_step.step);
+    // If enabled, run the Roc compilation pipeline before linking.
+    if (compile_bc_step) |s| {
+        build_result.lib.step.dependOn(&s.step);
+    }
 
     const roc_step = b.step("roc", "Full Roc compilation: Roc -> SBF bitcode -> SBF object -> .so");
     roc_step.dependOn(build_result.install_step);
